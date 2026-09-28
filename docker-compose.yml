@@ -1,0 +1,100 @@
+# WhatsApp Desk on one server: Postgres, Evolution API (patched), the desk, and Caddy for HTTPS.
+# Only Caddy is reachable from outside. Evolution and Postgres stay on the internal network.
+#
+#   cp .env.example .env   # fill it in (or run ./scripts/setup.sh, which does it for you)
+#   docker compose up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evolution
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Kolkata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evolution -d evolution"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  evolution:
+    build: ./evolution
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVER_TYPE: http
+      SERVER_PORT: "8080"
+      SERVER_URL: http://evolution:8080
+      CORS_ORIGIN: "*"
+      DEL_INSTANCE: "false"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://evolution:${POSTGRES_PASSWORD}@postgres:5432/evolution?schema=evolution_api
+      DATABASE_CONNECTION_CLIENT_NAME: whatsapp_desk
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      DATABASE_SAVE_DATA_LABELS: "true"
+      DATABASE_SAVE_DATA_HISTORIC: "true"
+      DATABASE_SAVE_IS_ON_WHATSAPP: "true"
+      DATABASE_SAVE_IS_ON_WHATSAPP_DAYS: "7"
+      CACHE_REDIS_ENABLED: "false"
+      CACHE_LOCAL_ENABLED: "true"
+      AUTHENTICATION_API_KEY: ${EVO_API_KEY:?Set EVO_API_KEY in .env}
+      QRCODE_LIMIT: "30"
+      CONFIG_SESSION_PHONE_CLIENT: WhatsApp Desk
+      CONFIG_SESSION_PHONE_NAME: Chrome
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      LOG_LEVEL: ERROR,WARN,INFO
+      LOG_COLOR: "false"
+      LANGUAGE: en
+      TZ: Asia/Kolkata
+    volumes:
+      - evolution_instances:/evolution/instances
+
+  desk:
+    build: ./desk
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      evolution:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://evolution:${POSTGRES_PASSWORD}@postgres:5432/evolution
+      EVO_URL: http://evolution:8080
+      EVO_API_KEY: ${EVO_API_KEY}
+      PORT: "8092"
+      HOST: 0.0.0.0
+      ALLOWED_HOSTS: ${DESK_DOMAIN:?Set DESK_DOMAIN in .env}
+      DESK_USER: ${DESK_USER:-admin}
+      DESK_PASSWORD: ${DESK_PASSWORD:?Set DESK_PASSWORD in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      TZ: Asia/Kolkata
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - desk
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DESK_DOMAIN: ${DESK_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  evolution_instances:
+  caddy_data:
+  caddy_config:

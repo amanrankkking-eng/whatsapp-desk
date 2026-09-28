@@ -1,0 +1,38 @@
+--- a/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
++++ b/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
+@@ -1945,6 +1945,35 @@
+                   this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                 ),
+               );
++
++              // evolution-local patch: WhatsApp reports delivery and read receipts for our own
++              // group messages only through this event, one per member. Store them in
++              // MessageUpdate so a client can show sent / delivered / read ticks.
++              for (const event of payload) {
++                try {
++                  if (!event.key?.fromMe || !event.key.id || !event.key.remoteJid) continue;
++                  const r = event.receipt || ({} as any);
++                  const st = r.playedTimestamp ? 'PLAYED' : r.readTimestamp ? 'READ' : r.receiptTimestamp ? 'DELIVERY_ACK' : null;
++                  if (!st) continue;
++                  const rows = (await this.prismaRepository.$queryRaw`
++                    SELECT id FROM "Message" WHERE "instanceId" = ${this.instanceId} AND "key"->>'id' = ${event.key.id} LIMIT 1
++                  `) as any[];
++                  if (!rows[0]?.id) continue;
++                  await this.prismaRepository.messageUpdate.create({
++                    data: {
++                      keyId: event.key.id,
++                      remoteJid: event.key.remoteJid,
++                      fromMe: true,
++                      participant: r.userJid || null,
++                      status: st,
++                      messageId: rows[0].id,
++                      instanceId: this.instanceId,
++                    },
++                  });
++                } catch (error) {
++                  this.logger.warn(`receipt not stored: ${error?.message || error}`);
++                }
++              }
+             }
+ 
+             if (events['presence.update']) {

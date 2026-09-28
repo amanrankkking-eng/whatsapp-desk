@@ -1,0 +1,35 @@
+#!/bin/zsh
+# Runs WhatsApp Desk on this Mac against the native Evolution install at ~/Claude/evolution-local.
+# Usage: scripts/mac/desk start | stop | restart | status | logs | test
+# The desk reads the database password and the Evolution key from that install by itself.
+set -u
+REPO="${0:A:h:h:h}"
+EVO="${LOCAL_EVOLUTION_DIR:-$HOME/Claude/evolution-local}"
+NODE_BIN="$EVO/runtime/node-v22.23.3-darwin-arm64/bin"
+LOG="$EVO/logs/desk.log"
+PIDFILE="$EVO/desk.pid"
+PORT="${PORT:-8092}"
+mkdir -p "$EVO/logs"
+pid() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && cat "$PIDFILE"; }
+
+start() {
+  if p=$(pid); then echo "desk: already running (pid $p) at http://localhost:$PORT"; return; fi
+  curl -s -o /dev/null "http://127.0.0.1:8080/" || echo "note: Evolution is not answering on :8080 yet; run $EVO/evo start"
+  lsof -ti tcp:$PORT >/dev/null 2>&1 && { echo "port $PORT is taken (the old dashboard?). Stop it first: launchctl bootout gui/$(id -u)/com.rankkking.evolution-dashboard"; exit 1; }
+  [[ -d "$REPO/desk/node_modules" ]] || (cd "$REPO/desk" && PATH="$NODE_BIN:$PATH" npm ci --omit=dev --no-audit --no-fund)
+  cd "$REPO/desk"
+  PORT=$PORT PATH="$NODE_BIN:$PATH" nohup node src/server.mjs >>"$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  for i in {1..20}; do curl -s -o /dev/null "http://127.0.0.1:$PORT/healthz" && { echo "desk: running at http://localhost:$PORT"; return; }; sleep 1; done
+  echo "desk: did not start, see $LOG"; tail -20 "$LOG"
+}
+stop() { if p=$(pid); then kill "$p"; rm -f "$PIDFILE"; echo "desk: stopped"; else echo "desk: not running"; fi; }
+case "${1:-status}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status) if p=$(pid); then echo "desk: running (pid $p) at http://localhost:$PORT"; else echo "desk: stopped"; fi ;;
+  logs) tail -n 80 -f "$LOG" ;;
+  test) cd "$REPO/desk" && PATH="$NODE_BIN:$PATH" npm test ;;
+  *) echo "usage: $0 start|stop|restart|status|logs|test"; exit 1 ;;
+esac

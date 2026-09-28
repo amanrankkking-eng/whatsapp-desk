@@ -1,0 +1,10 @@
+# Caddy fetches and renews the HTTPS certificate for DESK_DOMAIN by itself.
+# The domain's A record must point at this server and ports 80 and 443 must be open.
+{$DESK_DOMAIN} {
+	encode gzip
+	reverse_proxy desk:8092
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

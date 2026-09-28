@@ -1,0 +1,59 @@
+--- a/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
++++ b/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
+@@ -1740,7 +1740,13 @@
+ 
+       groupMetadataUpdate.forEach((group) => {
+         if (isJidGroup(group.id)) {
+-          this.updateGroupMetadataCache(group.id);
++          // evolution-local patch: groupFetchAllParticipating emits full metadata for every
++          // group; caching it directly avoids one WhatsApp query per group (rate-overlimit).
++          if (Array.isArray(group.participants) && group.subject !== undefined) {
++            this.setGroupMetadataCache(group.id, group as GroupMetadata);
++          } else {
++            this.updateGroupMetadataCache(group.id);
++          }
+         }
+       });
+     },
+@@ -4284,7 +4290,18 @@
+   }
+ 
+   // Group
++  // evolution-local patch: after WhatsApp answers rate-overlimit, stop asking for 10 minutes.
++  private groupMetadataBackoffUntil = 0;
++
++  private async setGroupMetadataCache(groupJid: string, meta: GroupMetadata) {
++    const cacheConf = this.configService.get<CacheConf>('CACHE');
++    if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
++      await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
++    }
++  }
++
+   private async updateGroupMetadataCache(groupJid: string) {
++    if (Date.now() < this.groupMetadataBackoffUntil) return null;
+     try {
+       const meta = await this.client.groupMetadata(groupJid);
+ 
+@@ -4297,6 +4314,11 @@
+ 
+       return meta;
+     } catch (error) {
++      if (String(error?.message || error).includes('rate-overlimit')) {
++        this.groupMetadataBackoffUntil = Date.now() + 10 * 60 * 1000;
++        this.logger.warn('group metadata rate-overlimit: pausing group metadata queries for 10 minutes');
++        return null;
++      }
+       this.logger.error(error);
+       return null;
+     }
+@@ -4450,7 +4472,9 @@
+ 
+     let groups = [];
+     for (const group of fetch) {
+-      const picture = await this.profilePicture(group.id);
++      // evolution-local patch: one profile-picture query per group made this call send
++      // hundreds of WhatsApp queries; pictures are not needed, so skip them.
++      const picture = null;
+ 
+       const result = {
+         id: group.id,

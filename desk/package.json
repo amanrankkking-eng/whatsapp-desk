@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-desk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "One dashboard for several WhatsApp numbers on one Evolution API server, with the reseller follow-up flow built in.",
+  "type": "module",
+  "main": "src/server.mjs",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test --test-timeout=300000 test/*.test.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
