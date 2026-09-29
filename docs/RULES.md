@@ -25,7 +25,7 @@ calendar from Stage 0 to Stage 12 against a mock Evolution API.
 | 10 | A follow-up ring and an offer ring | **Automatic**. Each ring keeps its own counter. |
 | 11 | One batch of each ring, half a ring apart | **Automatic** when a group is bound. |
 | 12 | Never-send list by name | Settings → *Never-send list*. It starts with test, testing, test group and shersth bharath. **Enforced**: these groups are never bound and never messaged. *Keep out any group whose name contains* starts with `01wire`, so Ahmad sir's 01Wire groups never enter Roshan's loop. |
-| 13 | Every group has one named owner | The owner is set on each reseller row. Alerts and the daily brief go to that owner by name. |
+| 13 | Every group has one named owner | The owner is set on each reseller row. Alerts and the daily brief go to that owner by name. A group in the loop without an owner is listed under *Needs a person* and named in the team summary. |
 | 14 | The reseller sheet | The **Resellers** page is the sheet: one row per reseller, with every column the flow reads and writes. **Export CSV** gives a copy at any time. |
 | 15 | The rate card | **Messages & rate card → Rate card**: packages, prices, named outlets (each can be switched off), reach, turnaround and sample link. Messages are built from it, never typed. |
 | 16 | Five heading styles | **Messages & rate card → Heading styles**. They rotate. |
@@ -51,9 +51,9 @@ calendar from Stage 0 to Stage 12 against a mock Evolution API.
 | # | Step | How |
 |---|---|---|
 | 32 | A new group is seen within 10 minutes | **Automatic**. The read runs every 3 minutes. It finds new groups from each number's chat list, and does a full group sync every 10 minutes. |
-| 33–35 | Read the members, remove our side, match the rest by phone | **Automatic**. "Our side" means every connected number, the team numbers, the other company numbers, and anyone in two or more of our groups. |
+| 33–35 | Read the members, remove our side, match the rest by phone | **Automatic**. "Our side" means every connected number, the team numbers, the other company numbers, and anyone in two or more of our groups. "Our groups" are the reseller groups (the ones bound to a row). A number's own old groups do not count, so a reseller who shares two community groups with it still counts as a reseller. |
 | 36 | Exactly one match binds | **Automatic**. The group must also hold exactly one sender number, and that sender becomes the group's own number. |
-| 37 | Anything else is reported | **Automatic**. No match, several matches, a reseller who already has a group, or two senders in one group all go to *Needs a person*, with **Bind to a reseller…** and **Ignore** buttons. |
+| 37 | Anything else is reported | **Automatic**. No match, several matches, a reseller who already has a group, or two senders in one group all go to *Needs a person*, with **Bind to a reseller…** and **Ignore** buttons. So does a group bigger than a reseller group can be (Settings: 15 members by default), such as a community the lead happens to sit in; it can still be bound by hand. |
 | 38 | The name is only a sanity check | **Enforced**: the group name is never used to match. A name that does not mention the code is noted in the log. |
 | 39–40 | Joins the sender's slice; one batch of each ring, half a ring apart | **Automatic**. |
 
@@ -74,7 +74,7 @@ calendar from Stage 0 to Stage 12 against a mock Evolution API.
 | 49 | Marked as read from the chat or set by a person | Shown on every row and in the preview. |
 | 50 | No status when the chat cannot be read | **Automatic**: listed under *Needs a status* on the Today page, *Needs a person*, and the chat summary. |
 | 51–53 | A counter per ring; today = counter + 1; wraps to 1 | **Automatic**. |
-| 54 | The counter moves only on a day a batch ran | **Enforced**. A stopped run or a day off never moves it. A send day with nothing due closes by itself after 17:30 as a rest day. A day with messages waiting for approval never moves without that approval. |
+| 54 | The counter moves only on a day a batch ran | **Enforced**. A stopped run or a day off never moves it. A send day with nothing due closes by itself after 17:30 as a rest day. A day with messages waiting for approval never moves without that approval. Nor does a day on which Evolution API was down: the same batch comes round the next day. |
 | 55 | Both counters move together | **Automatic**. |
 | 56 | Longest-waiting group first | **Automatic**. |
 | 57 | Nobody gets two messages in one day | **Enforced**: a group is in one ring at a time (its status), so it can be due only once per day. |
@@ -100,7 +100,7 @@ Every check runs at preview time. It runs again, live, right before each individ
 |---|---|---|
 | 68 | The next message in the group's own ladder | **Automatic**. The follow-up ladder is F1–F5; the offer ladder is O1–O3, and new ones can be added. |
 | 69–70 | Built from the rate card; unavailable outlets dropped | **Automatic**. |
-| 71 | A heading style is picked from the five | **Automatic**. It rotates across groups and rounds. |
+| 71 | A heading style is picked from the five | **Automatic**. It rotates across the day's groups, and a group never gets the heading it had last time. |
 | 72 | Package number never in the text | **Enforced**. It is kept only as a label on the send record. |
 | 73 | The reseller is @-mentioned | **Automatic**: it is a real WhatsApp mention. |
 | 74–77 | Tag rules | **Enforced**. Only a number in exactly one of our groups can be tagged. Team numbers are never tagged. Anyone tagged in the last 7 days is passed over for the next contact. With no safe contact, the message goes untagged. |
@@ -113,7 +113,7 @@ Every check runs at preview time. It runs again, live, right before each individ
 | 78 | The whole day as a preview | **Today's sends**: every name, group, sender, time, exact text, why that message, the tag, and every skip with its reason. |
 | 79 | Nothing sends until approved | **Enforced**. The approve dialog lists the named groups. The only automatic action is closing a day that has nothing to send, and that sends nothing. |
 | 80 | Each group from its own sender | **Enforced**. |
-| 81–82 | One at a time, a random 5–14 minute gap, never on a round minute | **Automatic**, for each number. Each sender sends one message at a time. Different senders run side by side. |
+| 81–82 | One at a time, a random 5–14 minute gap, never on a round minute | **Automatic**, for each number. Each sender sends one message at a time. Different senders run side by side. Each sender also starts at its own random moment after 10:30, so no two numbers open the day on the same second. |
 | 83 | 10:30–17:30, Monday to Friday | **Enforced** at approval and before every message. If the window closes, the run stops. |
 | 84 | About 10 per sender, 40 in total | **Enforced**: each sender has a daily cap, and there is a total cap. Both are editable. |
 | 85 | The first API error stops the run | **Enforced**. The rest waits for the next day, and the counters do not move. |
@@ -158,12 +158,12 @@ Steps 99–105 are **automatic**: the counters move, yesterday's groups go back 
 |---|---|---|
 | 118 | Order placed | Button. The row becomes an active reseller and leaves the rings. |
 | 119 | Asked to stop | **Automatic** on stop words (stop, band karo, mat bhejo…). Also a button. Do-not-contact is checked before everything else. |
-| 120 | Every message used | **Automatic**: marked exhausted and reported that way, never as converted. |
+| 120 | Every message used | **Automatic**: marked exhausted and named that way in every team summary, never counted as converted. |
 | 121 | Reseller left the group | **Automatic**: the row is paused and the owner alerted. **Enforced**: the group is never re-bound to anyone else in it. |
 | 122 | Wrong number / not on WhatsApp | A call outcome or a button. The row is marked invalid and leaves the pool. |
 | 123 | An exhausted group comes back | **Automatic** when a new message is added to its ladder. A person can also bring it back with **Put back in the loop**. |
 | 124 | Everything else stays in the loop | **Automatic**. |
-| 125–127 | A sender is lost | **Automatic**: only that sender's slice is skipped, and the others keep sending. **Numbers → Move slice** hands its groups to another sender. That sender must first be added to those groups. Its first message opens with "Hi, this is … writing to you from this number from now on." |
+| 125–127 | A sender is lost | **Automatic**: only that sender's slice is skipped, and the others keep sending. This holds in the middle of a run too: a short reconnect is waited out, and after three minutes that sender's remaining messages are skipped (they wait for their next turn) while the other senders carry on. Only Evolution API itself going down stops the whole run. **Numbers → Move slice** hands its groups to another sender. That sender must first be added to those groups. Its first message opens with "Hi, this is … writing to you from this number from now on." |
 | 128 | Nothing is lost | Every record is in our own database. `scripts/backup.sh` copies it. |
 
 ## Choices made where the document leaves room (please confirm)

@@ -51,6 +51,12 @@ export async function buildReports(runId) {
   if (needs.length) lines.push(`Need a status from a person: ${needs.map(n => n.name || n.code).join(', ')}`);
   if (tomorrow.length) lines.push(`Due tomorrow: ${tomorrow.map(t => t.name || t.code).join(', ')}`);
   if (pending.length) lines.push(`Unanswered replies: ${pending.map(p => `${p.name || p.code} -> ${p.owner_name || 'no owner'}`).join(', ')}`);
+  // 120: every message used and no reply - out of the queue, reported as exhausted, never as converted.
+  const exhausted = await q(`select code, name from desk.resellers where stage = 'exhausted' order by updated_at desc`);
+  if (exhausted.length) lines.push(`Exhausted (every message used, no reply): ${exhausted.slice(0, 15).map(x => x.name || x.code).join(', ')}${exhausted.length > 15 ? ` and ${exhausted.length - 15} more` : ''}`);
+  // 13: every group needs one named owner.
+  const noOwner = await q(`select code, name from desk.resellers where owner_id is null and group_jid is not null and stage not in ('active_reseller','not_interested','dnc','exhausted','invalid')`);
+  if (noOwner.length) lines.push(`Groups without an owner: ${noOwner.slice(0, 15).map(x => x.name || x.code).join(', ')}${noOwner.length > 15 ? ` and ${noOwner.length - 15} more` : ''}`);
   const team = lines.join('\n');
   const err = await postChat(s.team_chat_webhook, team);
   await q(`insert into desk.reports (day, kind, title, body, posted_at, post_error) values ($1, 'team', $2, $3, $4, $5)`,

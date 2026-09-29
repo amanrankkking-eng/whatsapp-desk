@@ -338,7 +338,10 @@ test('Stage 3-8: the day is previewed, approved, sent one at a time per number, 
   assert.equal(i1.tag.phone, P.ravi, '73: the reseller is tagged');
   assert.ok(i1.text.startsWith(`Hi @${P.ravi}\n\nQuick check-in`), i1.text);
   assert.match(i1.why, /batch 1 runs today; F1-checkin is the next message/);
-  assert.equal(i1.scheduledAt, new Date('2026-10-05T10:30:00+05:30').toISOString(), 'first send at 10:30');
+  // 82: each sender starts at its own random moment after 10:30, never on a round minute.
+  const first = new Date(i1.scheduledAt);
+  assert.ok(first > new Date('2026-10-05T10:31:00+05:30') && first < new Date('2026-10-05T10:39:00+05:30'), i1.scheduledAt);
+  assert.notEqual(first.getUTCSeconds(), 0, 'not on a round minute');
   assert.ok(!plan.items.some(i => i.text.includes(P.aman)), '75: a team number is never tagged');
   // 79: nothing has gone before approval.
   assert.equal(mock.sent.length, 4, 'only what people sent by hand so far: three first offers and one answer');
@@ -351,7 +354,7 @@ test('Stage 3-8: the day is previewed, approved, sent one at a time per number, 
   await assert.rejects(api('POST', '/api/today/approve', { ids: [] }), /still sending/, 'no second run while one is sending');
   await tick('sender');
   assert.equal(mock.sent.length, 0, '83: nothing goes before 10:30');
-  await at('2026-10-05T10:31:00');
+  await at('2026-10-05T10:40:00');
   await tick('sender');
   assert.equal(mock.sent.length, 2, 'both lanes send side by side, one message each');
   assert.deepEqual(mock.sent.map(x => x.instance).sort(), ['wa-sendera', 'wa-senderb']);
@@ -483,7 +486,7 @@ test('Stage 5-6: the offer ring, the six checks and the rate card', async () => 
   // 85: the first API error stops the run; nothing else goes and the counters stay.
   await api('POST', '/api/today/approve', { ids: [item.id] });
   await mockCall('fail-next', { status: 500, message: 'rate-overlimit' });
-  await at('2026-10-15T10:31:00');
+  await at('2026-10-15T10:40:00');
   await tick('sender');
   let run = (await api('GET', '/api/runs'))[0];
   assert.equal(run.status, 'stopped');
@@ -495,7 +498,7 @@ test('Stage 5-6: the offer ring, the six checks and the rate card', async () => 
   const p3 = (await api('GET', '/api/today')).plan;
   assert.equal(p3.batches.offer, 9);
   await api('POST', '/api/today/approve', { ids: p3.items.map(i => i.id) });
-  await at('2026-10-16T10:31:00');
+  await at('2026-10-16T10:40:00');
   await tick('sender');
   run = (await api('GET', '/api/runs'))[0];
   assert.equal(run.status, 'done');
@@ -554,6 +557,9 @@ test('Stage 12: order placed, exhausted and revived, reseller left, lost sender 
   const it = plan.items.find(i => i.code === 'R0003');
   assert.ok(it, JSON.stringify(plan.skips));
   assert.equal(it.sender, 'Sender C');
+  // 71: the group's next message never repeats the heading it got last time.
+  const lastH = (await db.query(`select heading_id from desk.sends where reseller_id = $1 and status = 'sent' and heading_id is not null order by sent_at desc limit 1`, [it.id])).rows[0]?.heading_id;
+  if (lastH) assert.notEqual(it.headingId, lastH, 'a different heading from last time');
   assert.match(it.text, /Hi, this is Kabir from Rankkking\. I will be writing to you from this number from now on\./);
   assert.equal(karan.id, it.id);
 });
@@ -782,4 +788,92 @@ test('Claude access: tokens, the MCP handshake, the tools and their guards', asy
   // A revoked token stops working at once.
   await api('DELETE', `/api/tokens/${read.id}`);
   assert.equal((await rpc(read.token, 'ping')).status, 401);
+});
+
+// ---------------------------------------------------------------- the process check of 29 Sep 2026
+test('125-126: a sender lost in the middle of a run stops only its own slice; the other senders keep sending', async () => {
+  const PX = { l1: '919822222201', l2: '919822222202' };
+  const GX = { a: '120363000000000011@g.us', b: '120363000000000012@g.us' };
+  await at('2026-11-02T09:00:00');   // Monday
+  const imp = await api('POST', '/api/resellers/import', { csv: `name,phone\nLane One,${PX.l1}\nLane Two,${PX.l2}`, source: 'lane test' });
+  assert.equal(imp.added.length, 2);
+  await mockCall('group', { jid: GX.a, subject: 'Lane One - Rankkking', members: [P.reader, P.b, PX.l1] });
+  await mockCall('group', { jid: GX.b, subject: 'Lane Two - Rankkking', members: [P.reader, P.c, PX.l2] });
+  await api('POST', `/api/chats/wa-senderb/${encodeURIComponent(GX.a)}/send`, { text: 'Hi, here is our first offer.' });
+  await api('POST', `/api/chats/wa-senderc/${encodeURIComponent(GX.b)}/send`, { text: 'Hi, here is our first offer.' });
+  await tick('read');
+  const rows = (await api('GET', '/api/resellers')).filter(r => [PX.l1, PX.l2].includes(r.phone));
+  assert.ok(rows.every(r => r.group_jid), JSON.stringify(rows.map(r => [r.code, r.group_jid])));
+  for (const r of rows) {
+    await api('POST', `/api/resellers/${r.id}/call`, { call: 1, outcome: 'Interested' });
+    await api('POST', `/api/resellers/${r.id}/call`, { call: 2, outcome: 'Interested' });
+  }
+  // Put both groups in the batch that runs on the 16th.
+  await db.query(`update desk.resellers set fu_batch = 3, of_batch = 11 where id = any($1)`, [rows.map(r => r.id)]);
+  await db.query(`update desk.ring_state set last_batch = 2, last_run_date = null`);
+  await db.query(`update desk.resellers set stage = 'exhausted' where code = 'R0002'`);
+  await at('2026-11-16T09:30:00');   // Monday, 14 days after the first offers
+  await tick('read');
+  const { plan } = await api('GET', '/api/today');
+  const mine = plan.items.filter(i => rows.some(r => r.id === i.id));
+  assert.equal(mine.length, 2, JSON.stringify(plan.skips.filter(k => rows.some(r => r.id === k.id))));
+  assert.deepEqual(mine.map(i => i.sender).sort(), ['Sender B', 'Sender C']);
+  const ap = await api('POST', '/api/today/approve', { ids: mine.map(i => i.id) });
+  assert.equal(ap.queued, 2);
+  await mockCall('chat-sink', null, 'DELETE');
+  const before = mock.sent.length;
+  await mockCall('state', { instance: 'wa-senderc', state: 'close' });
+  await at('2026-11-16T10:40:00');
+  await tick('sender');
+  assert.equal(mock.sent.length, before + 1, 'Sender B still sends');
+  assert.equal(mock.sent[mock.sent.length - 1].instance, 'wa-senderb');
+  let run = await api('GET', `/api/runs/${ap.runId}`);
+  assert.equal(run.run.status, 'running', 'the run goes on; a short reconnect is waited out');
+  await api('POST', '/api/test/clock', { advanceMs: 4 * 60000 });
+  await tick('sender');
+  run = await api('GET', `/api/runs/${ap.runId}`);
+  assert.equal(run.run.status, 'done', 'only the lost slice is skipped');
+  const c = run.sends.find(x => x.instance === 'wa-senderc');
+  assert.equal(c.status, 'skipped');
+  assert.match(c.error, /Sender C is close - its groups wait for their next turn/);
+  assert.ok(run.skips.some(k => /Sender C is close/.test(k.reason)), '66: the reason is written down');
+  assert.ok(!mock.sent.slice(before).some(x => x.instance === 'wa-senderc'), 'nothing went from the lost number');
+  // 54 and 65: the batch ran, so the rings move; the skipped group waits for its next turn.
+  const ring = (await db.query(`select last_batch from desk.ring_state order by ring`)).rows.map(r => r.last_batch);
+  assert.deepEqual(ring, [3, 3]);
+  const posts = await mockCall('chat-sink', null, 'GET');
+  const texts = posts.map(x => x.text);
+  assert.ok(texts.some(t => /Sender C .*disconnected \(close\) during run/.test(t)), JSON.stringify(texts));
+  const team = posts.filter(x => x.to === TEAM_HOOK && /\*WhatsApp Desk - /.test(x.text)).pop();
+  assert.ok(team, 'the team summary went out');
+  assert.match(team.text, /Sent: \*1\*/);
+  assert.match(team.text, /Sender C is close - its groups wait for their next turn: Lane Two/, '93: which check stopped it');
+  assert.match(team.text, /Exhausted \(every message used, no reply\): .*Sunita/, '120: reported as exhausted');
+  assert.match(team.text, /Groups without an owner: .*Lane One/, '13: a group without an owner is named');
+  await mockCall('state', { instance: 'wa-senderc', state: 'open' });
+  await db.query(`update desk.resellers set stage = 'live' where code = 'R0002'`);
+});
+
+test('34 and 37: "our groups" are the reseller groups, and a group too big to be one is never bound by itself', async () => {
+  const PX = { twice: '919833333301', big: '919833333302' };
+  // Someone in two groups that are not reseller groups is not one of ours.
+  await mockCall('group/add', { jid: G.g4, phone: PX.twice });
+  await mockCall('group/add', { jid: G.g5, phone: PX.twice });
+  // Someone in two reseller groups is.
+  await mockCall('group/add', { jid: G.g1, phone: P.stranger });
+  await mockCall('group/add', { jid: G.g3, phone: P.stranger });
+  for (const n of ['wa-reader', 'wa-sendera', 'wa-senderb', 'wa-senderc']) await api('POST', `/api/numbers/${n}/refresh-groups`);
+  await tick('read');
+  const ours = async phone => (await db.query(`select bool_or(is_ours) o from desk.people where phone = $1`, [phone])).rows[0].o;
+  assert.equal(await ours(PX.twice), false, 'two ordinary groups do not make someone ours');
+  assert.equal(await ours(P.stranger), true, 'two reseller groups do');
+  // A lead who sits in a big group with a sender: the group is reported, not bound.
+  const members = [P.reader, P.b, PX.big, ...Array.from({ length: 20 }, (_, i) => `9197000000${String(i).padStart(2, '0')}`)];
+  await api('POST', '/api/resellers/import', { csv: `name,phone\nBig Room Lead,${PX.big}`, source: 'size test' });
+  await mockCall('group', { jid: '120363000000000021@g.us', subject: 'Crypto PR community', members });
+  await tick('read');
+  const row = (await api('GET', '/api/resellers')).find(r => r.phone === PX.big);
+  assert.equal(row.group_jid, null, 'never bound by itself');
+  const issue = (await api('GET', '/api/bind-issues')).find(i => i.jid === '120363000000000021@g.us');
+  assert.match(issue.reason, /too big for a reseller group/);
 });

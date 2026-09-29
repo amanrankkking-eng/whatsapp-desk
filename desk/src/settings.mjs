@@ -30,6 +30,9 @@ export const DEFAULTS = {
   extra_own_numbers: {},       // other company numbers that are not connected here
   never_send_names: ['test', 'testing', 'test group', 'shersth bharath'], // 12: blocked by exact name (case-insensitive)
   exclude_name_words: ['01wire'],   // a name containing one of these is never in the pool
+  // Stage 2 - a reseller group holds the reseller, the reader, one sender and a few of the team.
+  // A bigger group (a community, a broadcast room) is never bound by itself, only by hand.
+  max_group_size: 15,
   // outputs
   team_chat_webhook: '',       // Stage 9: Google Chat space for the team summary
   ops_chat_webhook: '',        // system alerts (errors, disconnects); empty = the team space
@@ -51,7 +54,7 @@ export async function getSettings() {
 const NUMS = {
   min_gap_days: [0, 60], client_active_days: [0, 60], our_active_days: [0, 60], ball_in_court_days: [0, 120],
   gap_min_sec: [30, 3600], gap_max_sec: [30, 7200], daily_cap_total: [0, 500], batch_size: [1, 200],
-  ring_min_batches: [1, 200], tag_cooldown_days: [0, 60], alert_repeat_min: [5, 1440], warmup_days: [0, 90],
+  ring_min_batches: [1, 200], tag_cooldown_days: [0, 60], alert_repeat_min: [5, 1440], warmup_days: [0, 90], max_group_size: [3, 1024],
 };
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];

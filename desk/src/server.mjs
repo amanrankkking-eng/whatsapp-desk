@@ -142,8 +142,10 @@ async function overviewData() {
   const states = await liveStates();
   const nums = (await numbers.listNumbers()).map(n => ({ ...n, state: states[n.instance] || n.state }));
   const openErrors = await one(`select count(*)::int n from desk.errors where resolved_at is null`);
+  const noOwner = await one(`select count(*)::int n from desk.resellers where owner_id is null and group_jid is not null
+    and stage not in ('active_reseller','not_interested','dnc','exhausted','invalid')`);
   return { today, stages, sentToday: sentToday.n, repliesToday, openAlerts: openAlerts.n, bindIssues: issues.n, needsStatus: needs.n,
-    openErrors: openErrors.n, lastRun: run, numbers: nums, batches: await todaysBatches(), workers: workerState };
+    noOwner: noOwner.n, openErrors: openErrors.n, lastRun: run, numbers: nums, batches: await todaysBatches(), workers: workerState };
 }
 route('GET', '/api/overview', overviewData);
 

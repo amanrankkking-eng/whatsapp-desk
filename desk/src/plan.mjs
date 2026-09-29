@@ -69,7 +69,7 @@ export function runChecks(r, sum, rung, sentLabels, s) {
 // 74-77: tag the reseller if they are safe to tag, else another single-group contact, else nobody.
 async function resolveTag(r, s, taggedRecently) {
   const cands = await q(`
-    select distinct coalesce(gm.phone, lm.phone) phone, coalesce(p.name, '') pname, coalesce(p.group_count, 1) gc,
+    select distinct coalesce(gm.phone, lm.phone) phone, coalesce(p.name, '') pname, greatest(coalesce(p.group_count, 1), 1) gc,
       coalesce(p.is_ours, false) is_ours, (op.phone is not null) our_phone
     from ${LATEST_MEMBERS} gm
       left join desk.lid_map lm on lm.lid = gm.member_id
@@ -124,6 +124,10 @@ export async function planDay({ forApproval = false } = {}) {
   const laneUsed = Object.fromEntries(sentToday.map(x => [x.instance, x.n]));
   let totalLeft = s.daily_cap_total - sentToday.reduce((a, x) => a + x.n, 0);
   const headings = ladder.headings;
+  // 71: the heading each group got last time, so its next message reads differently.
+  const lastHeading = new Map((await q(`select distinct on (reseller_id) reseller_id, heading_id from desk.sends
+    where status = 'sent' and heading_id is not null and reseller_id = any($1) order by reseller_id, sent_at desc`, [todays.map(r => r.id)]))
+    .map(x => [x.reseller_id, x.heading_id]));
   const nextSlot = {};
   const windowStart = istToUtc(today, s.window_start).getTime(), windowEnd = istToUtc(today, s.window_end).getTime();
   const startAt = Math.max(now().getTime() + 60000, windowStart);
@@ -172,12 +176,15 @@ export async function planDay({ forApproval = false } = {}) {
     if (totalLeft <= 0) { skip(r, ring, `the day's total cap of ${s.daily_cap_total} is reached`); continue; }
 
     // 81-83: one at a time per number, random 5-14 minute gaps, inside the window.
-    const at = nextSlot[r.instance] || startAt;
+    // 82: each sender starts at its own random, never round, moment after the window opens.
+    const at = nextSlot[r.instance] ?? startAt + randomGapSec(61, 539) * 1000;
     if (at > windowEnd) { skip(r, ring, `falls after ${s.window_end}, the end of the sending window`); continue; }
 
     // 69-77: build the text.
     const pkg = rung.package_id ? ladder.packages.find(p => p.id === rung.package_id) : null;
-    const heading = headings.length ? headings[(plan.items.length + r.id) % headings.length] : null;
+    let hi = (plan.items.length + r.id) % (headings.length || 1);
+    if (headings.length > 1 && headings[hi].id === lastHeading.get(r.id)) hi = (hi + 1) % headings.length;
+    const heading = headings.length ? headings[hi] : null;
     let body = renderRung(rung, pkg, heading, s.business_name);
     const tag = await resolveTag(r, s, tagged);
     const lines = [];

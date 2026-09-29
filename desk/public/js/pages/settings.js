@@ -89,6 +89,7 @@ export default {
             <span class="help">Test rooms and our own internal rooms. Never bound, never messaged.</span></label>
           <label class="f"><span>Keep out any group whose name contains (one per line)</span><textarea class="in" data-list="exclude_name_words" rows="6">${esc(s.exclude_name_words.join('\n'))}</textarea>
             <span class="help">"01wire" keeps Ahmad sir's 01Wire groups out of this reseller loop. Spaces and dashes are ignored when matching.</span></label>
+          ${num('max_group_size', 'Largest group that is bound by itself (members)', 'A reseller group holds the reseller, the reader, one sender and a few of the team. A bigger group (a community, say) is never bound by itself: it shows under Needs a person and can be bound by hand.', 3, 1024)}
         </div></div>
 
         <div class="sticky-actions"><span class="small muted">Changes apply from the next preview.</span><span class="spacer"></span><button class="btn primary" data-save type="button">Save settings</button></div>

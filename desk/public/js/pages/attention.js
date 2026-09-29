@@ -11,6 +11,8 @@ export default {
       const needs = rows.filter(r => r.group_jid && !r.track && r.stage === 'live' && !r.paused && !r.hold && !r.dnc);
       const unreadable = rows.filter(r => r.group_jid && r.readable === false && !['dnc', 'invalid', 'active_reseller'].includes(r.stage));
       const noGroup = rows.filter(r => !r.group_jid && ['live', 'offer_sent', 'called_1'].includes(r.stage));
+      // 13: every group has exactly one named owner, who gets its alerts.
+      const noOwner = rows.filter(r => r.group_jid && !r.owner_id && !['active_reseller', 'not_interested', 'dnc', 'exhausted', 'invalid'].includes(r.stage));
       view.innerHTML = `<div class="page">
         <h2 class="sec" style="margin-top:0">${icon('group', 'sm')} Groups that could not be bound <span class="badge ${open.length ? 'red' : 'grey'}">${open.length}</span>
           <span class="spacer"></span><label class="check small"><input type="checkbox" data-ign ${showIgnored ? 'checked' : ''}> show ignored</label></h2>
@@ -34,6 +36,11 @@ export default {
         <div class="note small">An empty read means unknown, never quiet. Send the first offer into the group by hand; that gives it a readable history.</div>
         ${unreadable.length ? `<div class="tbl-wrap" style="margin-top:8px"><table class="tbl"><tbody>${unreadable.map(r => `<tr><td><a href="#/resellers/${r.id}">${esc(r.name || r.code)}</a></td>
           <td><a class="btn sm" href="#/chats/${encodeURIComponent(r.instance || '')}/${encodeURIComponent(r.group_jid)}">Open the chat</a></td></tr>`).join('')}</tbody></table></div>` : ''}
+
+        <h2 class="sec">${icon('user', 'sm')} Groups without an owner <span class="badge ${noOwner.length ? 'red' : 'grey'}">${noOwner.length}</span></h2>
+        <div class="note small">Every group needs one named owner: their replies alert that person by name. Without one, alerts go to the team space as "No owner set".</div>
+        ${noOwner.length ? `<div class="tbl-wrap" style="margin-top:8px"><table class="tbl"><tbody>${noOwner.map(r => `<tr><td><a href="#/resellers/${r.id}">${esc(r.name || r.code)}</a> <span class="small muted">${esc(r.code)}</span></td>
+          <td class="small">${esc(r.group_name || '')}</td><td class="nowrap"><a class="btn sm" href="#/resellers/${r.id}">Set the owner</a></td></tr>`).join('')}</tbody></table></div>` : ''}
 
         <h2 class="sec">Resellers with no group yet <span class="badge grey">${noGroup.length}</span></h2>
         ${noGroup.length ? `<div class="tbl-wrap"><table class="tbl"><tbody>${noGroup.map(r => `<tr><td><a href="#/resellers/${r.id}">${esc(r.name || r.code)}</a> <span class="small muted">${esc(r.code)} · +${esc(r.phone)}</span></td>

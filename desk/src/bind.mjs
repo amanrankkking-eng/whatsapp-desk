@@ -9,7 +9,7 @@ import { squash, now } from './util.mjs';
 export async function bindGroups() {
   const s = await getSettings();
   const groups = await q(`
-    select g.jid, max(g.subject) subject, array_agg(distinct g.instance) instances, bool_and(g.preexisting) preexisting
+    select g.jid, max(g.subject) subject, array_agg(distinct g.instance) instances, bool_and(g.preexisting) preexisting, max(g.size) size
     from desk.groups g
     where not g.left_group and not g.is_community
       and not exists (select 1 from desk.resellers r where r.group_jid = g.jid)
@@ -51,6 +51,10 @@ export async function bindGroups() {
     if (matches.length > 1) { await report('several resellers are members', { codes: matches.map(r => r.code) }); continue; }
     const r = matches[0];
     if (r.group_jid && r.group_jid !== g.jid) { await report(`${r.code} already has a different group`, { code: r.code }); continue; }
+    if (Number(g.size) > s.max_group_size) {
+      await report(`matches ${r.code} but has ${g.size} members - too big for a reseller group; bind it by hand if it really is theirs`, { code: r.code, size: g.size });
+      continue;
+    }
     const inGroup = senders.filter(sn => mem.some(m => m.phone === sn.phone || (sn.lid && sn.lid === m.member_id)));
     if (!inGroup.length) { await report(`matches ${r.code} but no sender number is in the group`, { code: r.code }); continue; }
     if (inGroup.length > 1) { await report(`matches ${r.code} but ${inGroup.length} sender numbers are in the group - keep one`, { code: r.code, senders: inGroup.map(x => x.instance) }); continue; }

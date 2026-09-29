@@ -9,6 +9,8 @@ import { buildReports } from './reports.mjs';
 import { opsAlert } from './monitor.mjs';
 
 const busy = new Set();
+// run|instance -> when that sender was first seen not connected during the run
+const laneDownSince = new Map();
 
 export async function stopRun(runId, reason, who) {
   const [claimed] = await q(`update desk.runs set status = 'stopped', stop_reason = $2, finished_at = $3 where id = $1 and status = 'running' returning id`, [runId, reason, now()]);
@@ -70,6 +72,11 @@ export async function workerTick() {
 // 54 and 105: a send day whose batches hold nothing to send is a rest day. Once the window has
 // closed it is recorded as run, so the counters move. A day with sends waiting for approval is
 // never closed automatically: without an approval the batch did not run and keeps its turn.
+// Nor is a day on which Evolution API was down: nothing could run, so, like a stopped run, it
+// costs nobody their turn (the same batch comes round next day). A single lost sender is
+// different (125): the day closes, its groups wait for their next turn, and the ring keeps
+// turning for everyone else.
+export const OUTAGE_SKIP = /^sender number .+ is unreachable$/;
 export async function closeRestDay() {
   const s = await getSettings();
   const today = istDate();
@@ -77,8 +84,27 @@ export async function closeRestDay() {
   if (await one(`select 1 from desk.runs where day = $1`, [today])) return { closed: false };
   const plan = await planDay();
   if (plan.items.length) return { closed: false, waiting: plan.items.length };
+  const outage = plan.skips.filter(k => OUTAGE_SKIP.test(k.reason));
+  if (outage.length) return { closed: false, outage: outage.length };
   const r = await approveDay([], 'auto (nothing to send)');
   return { closed: true, run: r.runId };
+}
+
+// Skips every message still queued for one sender in this run and tells the team.
+async function dropLane(run, instance, state) {
+  const n = await one(`select label, phone from desk.numbers where instance = $1`, [instance]);
+  const label = n?.label || instance;
+  const reason = `sender ${label} is ${state} - its groups wait for their next turn`;
+  const rows = await q(`update desk.sends set status = 'skipped', error = $3 where run_id = $1 and instance = $2 and status = 'queued'
+    returning reseller_id, jid, ring`, [run.id, instance, reason]);
+  for (const x of rows) {
+    await q(`insert into desk.skips (day, run_id, reseller_id, jid, ring, reason) values ($1,$2,$3,$4,$5,$6)`,
+      [istDate(run.day), run.id, x.reseller_id, x.jid, x.ring, reason]);
+  }
+  await logEvent('run.lane-drop', { run: run.id, instance, state, skipped: rows.length });
+  await opsAlert(`lane-drop:${run.id}:${instance}`, `⏸ ${label}${n?.phone ? ` (+${n.phone})` : ''} disconnected (${state}) during run #${run.id}. ` +
+    `Its ${rows.length} remaining message(s) are skipped and wait for their next turn; the other senders keep sending.`, 0);
+  await finishIfDone(run.id);
 }
 
 async function sendNext(run, instance, s) {
@@ -108,10 +134,22 @@ async function sendNext(run, instance, s) {
   if (failed.length) return skipSend(`${failed.map(f => f[0]).join(', ')}: ${failed.map(f => f[1]).join('; ')}`);
 
   const state = await connectionState(instance);
-  if (state !== 'open') {
-    await q(`update desk.sends set status = 'failed', error = $2 where id = $1`, [send.id, `number is ${state}`]);
-    return stopRun(run.id, `sender ${instance} is ${state} - the run stopped at the first failure`);
+  const laneKey = `${run.id}|${instance}`;
+  if (state === 'unreachable') {
+    // Evolution itself is not answering: nothing can send, so the whole run stops (85).
+    await q(`update desk.sends set status = 'failed', error = $2 where id = $1`, [send.id, 'Evolution API is not answering']);
+    return stopRun(run.id, 'Evolution API stopped answering - the run stopped at the first failure');
   }
+  if (state !== 'open') {
+    // 125-126: a lost number stops only its own slice. A short reconnect is waited out; after
+    // three minutes its messages in this run are skipped (they wait for their ring's next
+    // turn) and the other senders keep sending.
+    if (!laneDownSince.has(laneKey)) laneDownSince.set(laneKey, now().getTime());
+    if (now().getTime() - laneDownSince.get(laneKey) < 3 * 60000) return;
+    laneDownSince.delete(laneKey);
+    return dropLane(run, instance, state);
+  }
+  laneDownSince.delete(laneKey);
   await q(`update desk.sends set status = 'sending' where id = $1`, [send.id]);
   try {
     const body = { number: send.jid, text: send.text };

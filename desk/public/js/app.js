@@ -135,7 +135,7 @@ async function badges() {
       b.textContent = n; b.classList.toggle('hidden', !n); b.classList.toggle('red', !!red);
     };
     set('alerts', o.openAlerts, true);
-    set('attention', o.bindIssues + o.needsStatus, true);
+    set('attention', o.bindIssues + o.needsStatus + (o.noOwner || 0), true);
     set('numbers', o.numbers.filter(n => n.active && n.state !== 'open').length, true);
     set('health', o.openErrors, true);
     bus.emit('overview', o);

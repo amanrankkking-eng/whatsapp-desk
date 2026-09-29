@@ -247,7 +247,10 @@ export async function learnLidsFromMessages() {
 }
 
 // Everyone we share a group with, and whether they are on our side: our numbers, the team,
-// the other company numbers, and anyone in two or more of our groups.
+// the other company numbers, and anyone in two or more of our groups (34, 74).
+// "Our groups" are the reseller groups: the groups bound to a reseller row. A number that
+// was linked with its own old groups (community groups, other clients) must not turn
+// everyone who shares two of those into "one of ours": their replies would stop counting.
 export async function rebuildPeople() {
   const s = await getSettings();
   const numbers = await q(`select phone from desk.numbers where phone is not null`);
@@ -258,7 +261,8 @@ export async function rebuildPeople() {
   await tx(async t => {
     await t(`delete from desk.people`);
     await t(`insert into desk.people (member_id, phone, group_count)
-      select gm.member_id, coalesce(max(gm.phone), max(lm.phone)), count(distinct gm.jid)::int
+      select gm.member_id, coalesce(max(gm.phone), max(lm.phone)),
+        count(distinct gm.jid) filter (where exists (select 1 from desk.resellers r where r.group_jid = gm.jid))::int
       from desk.group_members gm join desk.groups g on g.instance = gm.instance and g.jid = gm.jid and not g.left_group
         left join desk.lid_map lm on lm.lid = gm.member_id
       group by gm.member_id`);
