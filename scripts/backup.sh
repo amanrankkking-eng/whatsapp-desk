@@ -11,5 +11,9 @@ vol=$(docker volume ls -q | grep -E '_evolution_instances$' | head -1)
 if [ -n "$vol" ]; then
   docker run --rm -v "${vol}:/data:ro" -v "$PWD/backups:/b" alpine tar czf "/b/instances-${stamp}.tgz" -C /data .
 fi
+# The Health page and the backup alert read this.
+docker compose exec -T postgres psql -U evolution -d evolution -qc \
+  "insert into desk.meta (key, value) values ('last_backup', jsonb_build_object('at', now(), 'file', 'desk-${stamp}.sql.gz'))
+   on conflict (key) do update set value = excluded.value" >/dev/null || echo "note: could not record the backup time"
 find backups -type f -mtime +30 -delete
 ls -lh backups | tail -5

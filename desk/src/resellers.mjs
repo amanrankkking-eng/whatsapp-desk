@@ -148,6 +148,7 @@ const ACTIONS = {
   reopen: { set: `stage=case when call2_at is not null then 'live' else 'called_1' end, paused=false, pause_reason=null, left_group=false`, note: 'put back into the loop by hand' },
   first_offer_sent: { set: `first_offer_at=coalesce(first_offer_at, now()), stage=case when stage in ('new','called_1') then 'offer_sent' else stage end`, note: 'first offer marked as sent' },
 };
+export const ACTION_NAMES = Object.keys(ACTIONS);
 export async function applyAction(id, action, who) {
   const a = ACTIONS[action];
   if (!a) throw httpError(400, 'Unknown action');

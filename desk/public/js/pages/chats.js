@@ -186,7 +186,7 @@ export default {
       threadEl.querySelector('[data-name]').textContent = thread.name;
       const bits = [];
       if (thread.isGroup) bits.push(`Group${thread.size ? ` · ${thread.size} members` : ''}`);
-      else bits.push(`+${thread.jid.split('@')[0]}`);
+      else bits.push(thread.phone ? `+${thread.phone}` : thread.jid.endsWith('@lid') ? 'number hidden by WhatsApp' : `+${thread.jid.split('@')[0]}`);
       if (n) bits.push(`via ${n.label}${thread.state !== 'open' ? ` (${stateLabel(thread.state)})` : ''}`);
       const sub = threadEl.querySelector('[data-sub]');
       sub.innerHTML = esc(bits.join(' · ')) + (thread.reseller ? ` · <a href="#/resellers/${thread.reseller.id}">${esc(thread.reseller.code)} ${esc(thread.reseller.name)}</a>${thread.reseller.paused ? ' <span class="pill warn">paused</span>' : ''}${thread.reseller.dnc ? ' <span class="pill bad">do not contact</span>' : ''}` : '');

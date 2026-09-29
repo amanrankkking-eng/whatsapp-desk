@@ -11,5 +11,6 @@ import messages from './messages.js';
 import reports from './reports.js';
 import settings from './settings.js';
 import log from './log.js';
+import health from './health.js';
 
-export const PAGES = [overview, chats, today, resellers, alerts, attention, numbers, messages, reports, settings, log];
+export const PAGES = [overview, chats, today, resellers, alerts, attention, numbers, messages, reports, health, settings, log];

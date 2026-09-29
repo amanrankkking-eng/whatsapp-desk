@@ -594,3 +594,192 @@ test('exports and the event log', async () => {
     assert.ok(ev.some(e => e.kind === k), `event ${k} is logged`);
   }
 });
+
+// ---------------------------------------------------------------- monitoring
+const sink = async () => (await mockCall('chat-sink', null, 'GET')).filter(x => x.to === TEAM_HOOK).map(x => x.text);
+
+test('monitoring: an error is recorded once with a count, reported once, marked fixed, and reported again if it returns', async () => {
+  await mockCall('chat-sink', null, 'DELETE');
+  for (const n of [1, 2]) {
+    const r = await api('POST', '/api/test/boom', { message: `test failure ${n} in order 4411${n}` }, { raw: true });
+    assert.equal(r.status, 500);
+  }
+  let open = await api('GET', '/api/errors');
+  const e = open.find(x => x.source === 'api' && /test failure/.test(x.message));
+  assert.ok(e, 'recorded');
+  assert.equal(e.count, 2, 'the same error twice is one row with a count');
+  assert.match(e.where_, /^src\/server\.mjs:\d+$/, 'where it happened');
+  assert.ok(e.version, 'the version it happened on');
+  const detail = await api('GET', `/api/errors/${e.id}`);
+  assert.match(detail.stack, /server\.mjs/);
+  assert.equal(detail.context.path, '/api/test/boom');
+  assert.equal((await sink()).filter(t => t.includes('Error in api')).length, 1, 'reported once, not on every repeat');
+  assert.equal((await api('GET', '/api/overview')).openErrors, open.length, 'the menu badge counts open errors');
+  await api('POST', `/api/errors/${e.id}/resolve`);
+  open = await api('GET', '/api/errors');
+  assert.ok(!open.some(x => x.id === e.id), 'fixed errors leave the open list');
+  assert.ok((await api('GET', '/api/errors?show=all')).find(x => x.id === e.id).resolved_by, 'who marked it fixed');
+  await api('POST', '/api/test/boom', { message: 'test failure 3 in order 44113' }, { raw: true });
+  const again = (await api('GET', '/api/errors')).find(x => x.source === 'api' && /test failure/.test(x.message));
+  assert.ok(again && again.id !== e.id && again.count === 1, 'a fixed error that returns is a new open error');
+  assert.equal((await sink()).filter(t => t.includes('Error in api')).length, 2, 'and is reported again');
+  // A page that breaks in the browser is recorded too, with the file and line.
+  await api('POST', '/api/client-error', { message: 'x is not defined', stack: `ReferenceError: x is not defined\n    at http://127.0.0.1:${DESK_PORT}/js/pages/chats.js:120:5`, page: '#/chats' });
+  const b = (await api('GET', '/api/errors')).find(x => x.source === 'browser');
+  assert.equal(b.where_, 'js/pages/chats.js:120');
+  // Keys and tokens never reach the errors table.
+  await api('POST', '/api/test/boom', { message: 'failed with apikey=abcdef1234567890 and Bearer wd_secretsecretsecret' }, { raw: true });
+  const leaked = (await api('GET', '/api/errors')).find(x => /failed with/.test(x.message));
+  assert.ok(!/abcdef1234567890|wd_secret/.test(leaked.message), leaked.message);
+  await api('POST', '/api/errors/resolve-all');
+  assert.equal((await api('GET', '/api/errors')).length, 0);
+});
+
+test('monitoring: a number that drops is reported with the reason after a minute, and again when it is back', async () => {
+  await mockCall('state', { instance: 'wa-sendera', state: 'close' });
+  await db.query(`update evolution_api."Instance" set "disconnectionReasonCode" = 401, "disconnectionObject" = $1, "disconnectionAt" = now() where name = 'wa-sendera'`,
+    [JSON.stringify({ error: 'Stream Errored (conflict)', content: [{ tag: 'conflict', attrs: { type: 'device_removed' } }] })]);
+  await mockCall('chat-sink', null, 'DELETE');
+  await tick('monitor');
+  assert.equal((await sink()).length, 0, 'a short blip is never reported');
+  await api('POST', '/api/test/clock', { advanceMs: 61000 });
+  await tick('monitor');
+  let texts = await sink();
+  const down = texts.find(t => t.includes('Sender A') && t.includes('disconnected'));
+  assert.ok(down, JSON.stringify(texts));
+  assert.match(down, /device was removed from the phone/, 'the reason in plain words');
+  await tick('monitor');
+  assert.equal((await sink()).filter(t => t.includes('disconnected')).length, 1, 'reported once');
+  const h = await api('GET', '/api/health');
+  const a = h.numbers.find(n => n.instance === 'wa-sendera');
+  assert.equal(a.state, 'close');
+  assert.ok(a.downSince);
+  assert.match(a.lastDisconnect.reason, /device was removed/);
+  assert.equal(a.lastDisconnect.code, 401);
+  assert.ok(h.workers.some(w => w.name === 'monitor'), 'the monitor job is listed');
+  assert.equal(h.evolution.ok, true);
+  await mockCall('state', { instance: 'wa-sendera', state: 'open' });
+  await tick('monitor');
+  texts = await sink();
+  assert.ok(texts.some(t => t.includes('Sender A') && t.includes('connected again')), JSON.stringify(texts));
+  const hz = await fetch(`http://127.0.0.1:${DESK_PORT}/healthz`);
+  const body = await hz.json();
+  assert.equal(hz.status, 200);
+  assert.equal(body.db, true);
+  assert.equal(body.evolution, true);
+  assert.equal(typeof body.numbers.total, 'number', 'number counts (cached for 10 seconds)');
+});
+
+// ---------------------------------------------------------------- Claude access (MCP)
+test('Claude access: tokens, the MCP handshake, the tools and their guards', async () => {
+  const read = await api('POST', '/api/tokens', { name: 'test read', scope: 'read' });
+  const write = await api('POST', '/api/tokens', { name: 'test write', scope: 'write' });
+  assert.match(read.token, /^wd_[A-Za-z0-9_-]{30,}$/);
+  assert.ok(!(await api('GET', '/api/tokens')).some(t => 'token' in t || 'token_hash' in t), 'the token is shown once, never listed');
+  let id = 0;
+  const rpc = async (token, method, params, headers = {}) => {
+    const res = await fetch(`http://127.0.0.1:${DESK_PORT}/mcp`, { method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers },
+      body: JSON.stringify(Array.isArray(method) ? method : { jsonrpc: '2.0', ...(method.startsWith('notifications/') ? {} : { id: ++id }), method, ...(params ? { params } : {}) }) });
+    const text = await res.text();
+    return { status: res.status, headers: res.headers, body: text ? JSON.parse(text) : null };
+  };
+  const call = async (token, name, args = {}) => {
+    const r = await rpc(token, 'tools/call', { name, arguments: args });
+    assert.equal(r.status, 200);
+    const res = r.body.result;
+    return { error: !!res.isError, text: res.content[0].text, data: res.isError ? null : JSON.parse(res.content[0].text) };
+  };
+  // Guards on the endpoint itself.
+  let r = await rpc(null, 'initialize', {});
+  assert.equal(r.status, 401, 'a token is required, even on localhost');
+  assert.match(r.headers.get('www-authenticate'), /^Bearer/);
+  assert.equal((await rpc('wd_notarealtokennotarealtoken12', 'ping')).status, 401);
+  assert.equal((await rpc(read.token, 'ping', null, { origin: 'https://evil.example' })).status, 403, 'a foreign web page is refused');
+  assert.equal((await fetch(`http://127.0.0.1:${DESK_PORT}/mcp`, { headers: { authorization: `Bearer ${read.token}` } })).status, 405);
+  assert.equal((await rpc(read.token, 'ping', null, { 'mcp-protocol-version': '1999-01-01' })).status, 400);
+  assert.equal((await fetch(`http://127.0.0.1:${DESK_PORT}/.well-known/oauth-protected-resource`)).status, 404);
+  // The handshake.
+  r = await rpc(read.token, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.result.protocolVersion, '2025-06-18');
+  assert.equal(r.body.result.serverInfo.name, 'whatsapp-desk');
+  assert.ok(r.body.result.capabilities.tools);
+  assert.match(r.body.result.instructions, /explicit yes/);
+  assert.equal((await rpc(read.token, 'initialize', { protocolVersion: '2099-01-01' })).body.result.protocolVersion, '2025-11-25', 'an unknown version gets the newest one');
+  r = await rpc(read.token, 'notifications/initialized');
+  assert.equal(r.status, 202);
+  assert.equal(r.body, null);
+  assert.deepEqual((await rpc(read.token, 'ping')).body.result, {});
+  assert.equal((await rpc(read.token, 'no/such')).body.error.code, -32601);
+  assert.equal((await rpc(read.token, 'tools/call', { name: 'no_such_tool', arguments: {} })).body.error.code, -32602);
+  r = await rpc(read.token, [{ jsonrpc: '2.0', id: 'a', method: 'ping' }, { jsonrpc: '2.0', method: 'notifications/initialized' }, { jsonrpc: '2.0', id: 'b', method: 'tools/list' }]);
+  assert.deepEqual(r.body.map(x => x.id), ['a', 'b'], 'a batch gets one answer per request');
+  // Read tokens see only the reading tools.
+  const readTools = (await rpc(read.token, 'tools/list')).body.result.tools.map(t => t.name);
+  const writeTools = (await rpc(write.token, 'tools/list')).body.result.tools;
+  assert.ok(readTools.includes('desk_status') && readTools.includes('read_chat'));
+  assert.ok(!readTools.includes('send_message') && !readTools.includes('approve_today'));
+  assert.ok(writeTools.some(t => t.name === 'send_message'));
+  for (const t of writeTools) {
+    assert.ok(t.description && t.inputSchema?.type === 'object', t.name);
+    assert.equal(typeof t.annotations.readOnlyHint, 'boolean', t.name);
+  }
+  assert.match((await call(read.token, 'send_message', { number: 'wa-senderb', chat: G.g2, text: 'x', confirm: true })).text, /can only read/);
+  // Reading.
+  const st = await call(read.token, 'desk_status');
+  assert.equal(st.data.numbers.length, 4);
+  assert.ok(st.data.numbers.every(n => n.id && n.state));
+  const chat = await call(read.token, 'read_chat', { number: 'Reader', chat: 'ravi x', limit: 5 });
+  assert.equal(chat.data.chat, G.g1, 'a chat is found by part of its name, a number by its label');
+  assert.ok(chat.data.messages.length > 0 && chat.data.messages.length <= 5);
+  assert.ok(chat.data.messages.every(m => m.at && m.by));
+  const byPhone = await call(read.token, 'list_chats', { search: 'Sunita' });
+  assert.ok(byPhone.data.chats.some(c => c.chat === G.g2));
+  assert.equal((await call(read.token, 'read_chat', { number: 'wa-nothing', chat: 'x' })).error, true);
+  assert.ok((await call(read.token, 'find_resellers', { query: 'Karan' })).data.resellers.some(x => x.code === 'R0003'));
+  assert.equal((await call(read.token, 'reseller_detail', { code: 'r0003' })).data.reseller.code, 'R0003');
+  const preview = await call(read.token, 'today_preview');
+  assert.ok(Array.isArray(preview.data.to_send) && Array.isArray(preview.data.skipped));
+  assert.ok((await call(read.token, 'health_report')).data.numbers.length === 4);
+  assert.ok(Array.isArray((await call(read.token, 'errors_recent')).data));
+  assert.ok(Array.isArray((await call(read.token, 'list_runs')).data));
+  assert.ok((await call(read.token, 'list_groups', { search: 'Wire' })).data.some(g => g.chat === G.g7));
+  assert.match((await call(read.token, 'find_resellers', { stage: 'nonsense' })).text, /must be one of/, 'arguments are checked');
+  // Sending: every guard, then one real send.
+  assert.match((await call(write.token, 'send_message', { number: 'wa-senderb', chat: G.g2, text: 'Hello from Claude', confirm: false })).text, /confirm must be true/);
+  assert.match((await call(write.token, 'send_message', { number: 'wa-reader', chat: G.g1, text: 'x', confirm: true })).text, /reader number/);
+  assert.match((await call(write.token, 'send_message', { number: 'wa-sendera', chat: G.g7, text: 'x', confirm: true })).text, /kept out/, '01Wire groups are refused');
+  assert.match((await call(write.token, 'send_message', { number: 'wa-senderc', chat: G.g5, text: 'x', confirm: true })).text, /never-send/);
+  assert.match((await call(write.token, 'send_message', { number: 'wa-senderb', chat: '918888777666', text: 'x', confirm: true })).text, /No chat/, 'no brand-new chats');
+  const before = (await mockCall('sent', null, 'GET')).length;
+  const sent = await call(write.token, 'send_message', { number: 'Sender B', chat: G.g2, text: 'Hello from Claude, approved by Aman', confirm: true });
+  assert.equal(sent.error, false, sent.text);
+  const log = await mockCall('sent', null, 'GET');
+  assert.equal(log.length, before + 1);
+  assert.equal(log[log.length - 1].text, 'Hello from Claude, approved by Aman');
+  assert.equal(log[log.length - 1].instance, 'wa-senderb');
+  await call(write.token, 'reseller_action', { code: 'R0001', action: 'dnc' });
+  assert.match((await call(write.token, 'send_message', { number: 'wa-sendera', chat: G.g1, text: 'x', confirm: true })).text, /do-not-contact/);
+  // Approving the day: only codes in today's list, only with confirm.
+  assert.match((await call(write.token, 'approve_today', { codes: ['R9999'], confirm: true })).text, /Unknown codes/);
+  assert.match((await call(write.token, 'approve_today', { codes: ['R0006'], confirm: true })).text, /Not in today's list/);
+  assert.match((await call(write.token, 'approve_today', { codes: ['R0003'] })).text, /confirm is required/);
+  const inPlan = preview.data.to_send.map(i => i.code);
+  if (inPlan.length) {
+    const ok = await call(write.token, 'approve_today', { codes: [inPlan[0]], confirm: true });
+    assert.equal(ok.error, false, ok.text);
+    assert.equal(ok.data.queued, 1);
+    const run = await api('GET', `/api/runs/${ok.data.run_id}`);
+    assert.equal(run.run.approved_by, 'mcp:test write', 'the approval is recorded under the token name');
+    assert.equal((await call(write.token, 'stop_run', { run_id: ok.data.run_id })).error, false);
+    assert.equal((await api('GET', `/api/runs/${ok.data.run_id}`)).run.status, 'stopped');
+  }
+  // Every call is in the activity log under the token's name.
+  const ev = await api('GET', '/api/events?limit=500');
+  assert.ok(ev.some(e => e.kind === 'mcp.send_message' && e.who === 'mcp:test write'));
+  assert.ok(ev.some(e => e.kind === 'chat.send' && e.detail.via === 'mcp'));
+  // A revoked token stops working at once.
+  await api('DELETE', `/api/tokens/${read.id}`);
+  assert.equal((await rpc(read.token, 'ping')).status, 401);
+});

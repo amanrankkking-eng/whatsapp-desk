@@ -6,6 +6,7 @@ import { groupMessages, groupMemberPhones, summarise } from './read.mjs';
 import { runChecks, planDay, approveDay } from './plan.mjs';
 import { istDate, istWeekday, istToUtc, now } from './util.mjs';
 import { buildReports } from './reports.mjs';
+import { opsAlert } from './monitor.mjs';
 
 const busy = new Set();
 
@@ -14,6 +15,8 @@ export async function stopRun(runId, reason, who) {
   if (!claimed) return { ok: false };
   await q(`update desk.sends set status = 'cancelled', error = $2 where run_id = $1 and status = 'queued'`, [runId, reason]);
   await logEvent('run.stop', { run: runId, reason }, who);
+  // A person who pressed Stop knows; a run that stopped by itself is worth a message.
+  if (!/^stopped by /.test(reason)) await opsAlert(`run-stop:${runId}`, `⏹ Run #${runId} stopped by itself: ${reason}. The messages not yet sent wait for their next turn.`, 0);
   // 85: the rest of the list is untouched and picked up next day: the counters do not move.
   await buildReports(runId).catch(e => console.error('[reports]', e.message));
   return { ok: true };

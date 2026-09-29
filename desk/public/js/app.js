@@ -1,5 +1,5 @@
 // The app shell: login, navigation, routing and the live badges.
-import { api, get, bus, esc, icon, toast, fail, anyOverlayOpen } from './core.js';
+import { api, get, bus, esc, icon, toast, fail, anyOverlayOpen, ApiError } from './core.js';
 import { PAGES } from './pages/index.js';
 import { openAddWhatsApp } from './pages/numbers.js';
 
@@ -19,6 +19,25 @@ function toggleTheme() {
   applyTheme();
 }
 applyTheme();
+
+// ---------------------------------------------------------------- errors in this page
+// A page that breaks is recorded on the Health page like a server error (at most five a load).
+let reportedErrors = 0;
+function reportError(message, stack, where) {
+  if (reportedErrors >= 5 || !me) return;
+  reportedErrors++;
+  fetch('/api/client-error', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-desk': '1' },
+    body: JSON.stringify({ message: String(message || 'unknown').slice(0, 500), stack: String(stack || '').slice(0, 3000), where, page: location.hash, agent: navigator.userAgent }) }).catch(() => {});
+}
+window.addEventListener('error', e => {
+  if (e.filename && !e.filename.startsWith(location.origin)) return;       // browser extensions
+  reportError(e.message, e.error?.stack, e.filename ? `${e.filename.replace(location.origin, '')}:${e.lineno}` : '');
+});
+window.addEventListener('unhandledrejection', e => {
+  const r = e.reason;
+  if (r instanceof ApiError) return;                                        // already shown as a toast
+  reportError(r?.message || String(r), r?.stack, '');
+});
 
 // ---------------------------------------------------------------- login
 function showLogin(msg) {
@@ -118,6 +137,7 @@ async function badges() {
     set('alerts', o.openAlerts, true);
     set('attention', o.bindIssues + o.needsStatus, true);
     set('numbers', o.numbers.filter(n => n.active && n.state !== 'open').length, true);
+    set('health', o.openErrors, true);
     bus.emit('overview', o);
   } catch {}
 }

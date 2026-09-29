@@ -1,7 +1,7 @@
 // The WhatsApp-style inbox: chat lists, threads, replies, media and delivery ticks, per number.
 import { q, one } from './db.mjs';
 import { evo, connectionState, encodeInstance } from './evo.mjs';
-import { textOf, bodyText, mediaInfo, httpError, now } from './util.mjs';
+import { textOf, bodyText, mediaInfo, httpError, now, istDate, istToUtc, addIstDays, TEXT_SQL, typeLabel } from './util.mjs';
 
 const RANK = { ERROR: -1, PENDING: 1, SERVER_ACK: 2, DELIVERY_ACK: 3, READ: 4, PLAYED: 5 };
 const RANK_NAME = { '-1': 'ERROR', 1: 'PENDING', 2: 'SERVER_ACK', 3: 'DELIVERY_ACK', 4: 'READ', 5: 'READ' };
@@ -62,17 +62,21 @@ export async function listChats(instance) {
     last as (select distinct on (instance, jid) instance, jid, from_me last_from_me, type, message, status, row_id last_row, ts last_msg_ts
               from m order by instance, jid, ts desc, row_id desc)
     select a.*, l.last_from_me, l.type, l.message, l.status last_status, l.last_row, l.last_msg_ts,
-      coalesce(g.subject, c.name, ct."pushName", a.any_name) as name, g.size, r.id reseller_id, r.code reseller_code, r.name reseller_name, r.instance reseller_instance
+      coalesce(g.subject, c.name, nullif(ct."pushName", split_part(a.jid, '@', 1)), nullif(a.any_name, split_part(a.jid, '@', 1)),
+        case when lm.phone is not null then '+' || lm.phone end, a.any_name) as name,
+      g.size, r.id reseller_id, r.code reseller_code, r.name reseller_name, r.instance reseller_instance, lm.phone lid_phone
     from agg a join last l using (instance, jid)
       left join desk.groups g on g.instance = a.instance and g.jid = a.jid
       left join evolution_api."Instance" i on i.name = a.instance
       left join evolution_api."Chat" c on c."remoteJid" = a.jid and c."instanceId" = i.id
       left join evolution_api."Contact" ct on ct."remoteJid" = a.jid and ct."instanceId" = i.id
       left join desk.resellers r on r.group_jid = a.jid
+      left join desk.lid_map lm on lm.lid = a.jid
     order by a.last_ts desc limit 2000`, [inst, installed]);
   const stats = await statsFor(rows.filter(r => r.last_from_me), 'last_row');
   return rows.map(r => ({
     instance: r.instance, jid: r.jid, name: r.name, isGroup: r.jid.endsWith('@g.us'), size: r.size, unread: r.unread,
+    phone: r.jid.endsWith('@s.whatsapp.net') ? r.jid.split('@')[0] : r.lid_phone || null,
     lastTs: Number(r.last_ts), inbound: r.inbound, outbound: r.outbound, lastFromMe: r.last_from_me,
     lastStatus: tickStatus({ from_me: r.last_from_me, status: r.last_status, row_id: r.last_row, ts: Number(r.last_msg_ts) }, stats, r.jid.endsWith('@g.us'), r.size),
     lastText: textOf(r.message, r.type).slice(0, 160),
@@ -100,10 +104,13 @@ export async function chatMessages(instance, jid, limit) {
     left join evolution_api."Contact" ct on ct."remoteJid" = c."remoteJid" and ct."instanceId" = c."instanceId"
     where c."remoteJid" = $2 and i.name = $1 limit 1`, [instance, jid]);
   const reseller = await one(`select id, code, name, stage, paused, pause_reason, track, dnc from desk.resellers where group_jid = $1`, [jid]);
+  const phone = jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0]
+    : jid.endsWith('@lid') ? (await one(`select phone from desk.lid_map where lid = $1`, [jid]))?.phone || null : null;
   const stats = await statsFor(rows.filter(r => r.from_me), 'row_id');
   const isGroup = jid.endsWith('@g.us');
   return {
-    instance, jid, name: g?.subject || c?.name || jid.split('@')[0], isGroup, size: g?.size ?? null, adminsOnly: !!g?.announce,
+    instance, jid, phone, name: g?.subject || (c?.name && c.name !== jid.split('@')[0] ? c.name : null) || (phone ? `+${phone}` : jid.split('@')[0]),
+    isGroup, size: g?.size ?? null, adminsOnly: !!g?.announce,
     state: await connectionState(instance), reseller,
     messages: rows.map(r => ({
       id: r.id, fromMe: r.from_me, ours: r.ours, ts: Number(r.ts), type: r.type,
@@ -158,4 +165,29 @@ export async function mediaOf(instance, id) {
   mediaCache.set(k, out);
   while (mediaCache.size > 40) mediaCache.delete(mediaCache.keys().next().value);
   return out;
+}
+
+// Replies on a day, for every group of every number (not only reseller groups).
+export async function repliesByDay(dayArg) {
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(dayArg || '') ? dayArg : istDate();
+  const from = istToUtc(day, '00:00').getTime() / 1000, to = istToUtc(addIstDays(day, 1), '00:00').getTime() / 1000;
+  // Several of our numbers can sit in one group and each stores the same message: count ids once.
+  const rows = await q(`select m.jid, count(distinct m.id) filter (where not m.ours)::int replies, count(distinct m.id) filter (where m.ours)::int ours,
+      max(m.ts) filter (where not m.ours) last_ts, array_agg(distinct m.instance) instances
+    from desk.msgx m where m.ts >= $1 and m.ts < $2 and m.jid like '%@g.us' group by m.jid order by replies desc`, [from, to]);
+  const jids = rows.map(r => r.jid);
+  const names = await q(`select distinct on (jid) jid, subject from desk.groups where jid = any($1) and subject is not null`, [jids]);
+  const rs = await q(`select id, code, name, group_jid from desk.resellers where group_jid = any($1)`, [jids]);
+  const last = await q(`select distinct on (jid) jid, ${TEXT_SQL} txt, type, sender_name from desk.msgx
+    where jid = any($1) and not ours and ts >= $2 and ts < $3 order by jid, ts desc`, [jids, from, to]);
+  return { day, groups: rows.map(r => ({ ...r, last_ts: Number(r.last_ts) || null, name: names.find(n => n.jid === r.jid)?.subject || r.jid,
+    reseller: rs.find(x => x.group_jid === r.jid) || null,
+    lastText: (x => x ? `${x.sender_name ? `${x.sender_name}: ` : ''}${typeLabel(x.type, x.txt)}`.slice(0, 200) : '')(last.find(l => l.jid === r.jid)) })) };
+}
+
+export async function listAlerts(show) {
+  return q(`select a.*, r.code, r.name, o.name owner_name,
+      (select subject from desk.groups g where g.jid = a.jid and subject is not null limit 1) group_name
+    from desk.alerts a join desk.resellers r on r.id = a.reseller_id left join desk.owners o on o.id = a.owner_id
+    where ($1 = 'all' or a.acked_at is null) order by a.acked_at nulls first, a.last_at desc limit 300`, [show === 'all' ? 'all' : 'open']);
 }

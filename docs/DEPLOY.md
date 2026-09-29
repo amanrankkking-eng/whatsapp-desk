@@ -74,10 +74,10 @@ From then on, every send day: **Today's sends**, check the list, then **Approve 
 
 ```bash
 cd whatsapp-desk
-git pull
-docker compose up -d --build
+./scripts/update.sh
 ```
 
+This pulls the code and rebuilds. The image is stamped with the commit, so every error recorded afterwards shows which version it happened on.
 The database schema updates itself when the desk starts. A restart never resends anything. A message that was in flight is marked failed and its run stops, so a person can check the group before it goes again.
 
 ## Backups
@@ -93,7 +93,50 @@ For a daily backup at 02:15, add this with `crontab -e`:
 15 2 * * * cd /root/whatsapp-desk && ./scripts/backup.sh >/dev/null 2>&1
 ```
 
+Each backup records its time. The Health page shows it, and the desk sends an alert when the last backup is more than 36 hours old.
 Copy `backups/` off the server now and then, for example to Google Drive with rclone.
+
+## Monitoring: knowing when something breaks
+
+The desk watches itself. Everything it finds is on the **Health** page, and it is also sent to Google Chat: the system alerts webhook in Settings, or the team space when that is empty.
+
+| What | When it is reported |
+|---|---|
+| A new error in the code (server, background job, Claude tool or a page in the browser) | At once, with where it happened (file:line). If it keeps happening, again at most once an hour. The same error is one row with a count. |
+| A number disconnects | After it has been off for one minute, with WhatsApp's reason in plain words (removed on the phone, two sessions at once, network...). Again when it is back. |
+| A background job fails 3 times in a row | At once, and again when it works again. When the error shows the database is down, the alert says so. |
+| Evolution API stops answering | After 2 minutes. |
+| The desk crashed or was killed | When it starts again. Docker, or `scripts/mac/desk` on the Mac, restarts it by itself. |
+| A send run stops by itself | At once, with the reason (the window closed, a sender dropped, an API error). |
+| The disk is 85% full, or the last backup is over 36 hours old | Checked every 30 minutes. |
+
+At most 20 system alerts go out an hour, so a storm never floods the space. Secrets (API keys, tokens, passwords, webhook keys) are removed before anything is stored or sent.
+
+On the Health page, **Details** shows an error's stack trace. **Mark fixed** closes it once the fix is deployed. If it happens again, it opens again as a new error.
+With Claude access (see [MCP.md](MCP.md)), Claude can read the same errors with `errors_recent` and find the bug.
+
+### When the whole server is down
+
+A server that is down cannot report anything, so add an outside check too:
+
+1. Make a free account at uptimerobot.com.
+2. Add a monitor. Type: HTTP(s). URL: `https://desk.yourcompany.com/healthz`. Interval: 5 minutes.
+3. Add your email or phone as the alert contact.
+
+`/healthz` answers 200 when the database and Evolution API answer, and 503 when either does not. It needs no login and shows no private data.
+
+### Logs
+
+```bash
+docker compose logs --tail 200 desk
+docker compose logs --tail 200 evolution
+```
+
+Each service keeps at most 5 log files of 10 MB, so logs never fill the disk.
+
+## Claude access
+
+To let Claude Code or Claude Desktop work with the desk, make a token under **Settings → Claude access**. The steps and the full tool list are in [MCP.md](MCP.md).
 
 ## Without a domain (not recommended)
 
@@ -114,4 +157,5 @@ For a full copy of the Mac data, restore a `pg_dump` of the `desk` schema.
 | "Unknown host" (421) | `DESK_DOMAIN` in `.env` must match the address in the browser exactly. |
 | A number shows "Evolution not answering" | `docker compose logs evolution`. |
 | "Couldn't link device" on the phone | Scan the next QR. The first one can fail while WhatsApp rotates a secret; the Baileys patch handles the rest. |
-| Background jobs | The Overview page shows each job's last run and last error. |
+| Background jobs | The Health page shows each job's last run, how many times in a row it failed, and its last error. |
+| Something broke and you do not know what | Health → Errors: each error with its file and line; **Details** shows the stack trace. |

@@ -177,7 +177,20 @@ export async function migrate() {
     ) s
       left join desk.people p on p.member_id = s.sender_id
       left join desk.our_phones op on op.phone = s.sender_phone`);
-  await q(`insert into desk.meta (key, value) values ('schema_version', '1') on conflict (key) do update set value = excluded.value`);
+  // ---- monitoring: every server-side error, grouped; system alerts sent; tokens for Claude (MCP)
+  await q(`create table if not exists desk.errors (
+    id bigserial primary key, fingerprint text not null, source text not null, where_ text, message text not null,
+    stack text, context jsonb, version text, count int not null default 1,
+    first_at timestamptz not null default now(), last_at timestamptz not null default now(),
+    notified_at timestamptz, resolved_at timestamptz, resolved_by text)`);
+  await q(`create unique index if not exists errors_open_fp on desk.errors(fingerprint) where resolved_at is null`);
+  await q(`create table if not exists desk.ops_alerts (key text primary key, last_sent_at timestamptz not null, sent int not null default 1, last_text text)`);
+  await q(`create table if not exists desk.api_tokens (
+    id serial primary key, name text not null, token_hash text not null unique, created_at timestamptz not null default now(),
+    last_used_at timestamptz, revoked_at timestamptz)`);
+  // read = look only; write = may also change rows, approve the day and send one message
+  await q(`alter table desk.api_tokens add column if not exists scope text not null default 'read'`);
+  await q(`insert into desk.meta (key, value) values ('schema_version', '2') on conflict (key) do update set value = excluded.value`);
 }
 
 export async function logEvent(kind, detail = {}, who = null) {

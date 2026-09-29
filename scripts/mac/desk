@@ -2,8 +2,10 @@
 # Runs WhatsApp Desk on this Mac against the native Evolution install at ~/Claude/evolution-local.
 # Usage: scripts/mac/desk start | stop | restart | status | logs | test
 # The desk reads the database password and the Evolution key from that install by itself.
+# A supervisor loop starts the desk again if it ever crashes (a clean stop ends the loop).
 set -u
-REPO="${0:A:h:h:h}"
+SELF="${0:A}"
+REPO="${SELF:h:h:h}"
 EVO="${LOCAL_EVOLUTION_DIR:-$HOME/Claude/evolution-local}"
 NODE_BIN="$EVO/runtime/node-v22.23.3-darwin-arm64/bin"
 LOG="$EVO/logs/desk.log"
@@ -15,15 +17,37 @@ pid() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && cat "$
 start() {
   if p=$(pid); then echo "desk: already running (pid $p) at http://localhost:$PORT"; return; fi
   curl -s -o /dev/null "http://127.0.0.1:8080/" || echo "note: Evolution is not answering on :8080 yet; run $EVO/evo start"
-  lsof -ti tcp:$PORT >/dev/null 2>&1 && { echo "port $PORT is taken (the old dashboard?). Stop it first: launchctl bootout gui/$(id -u)/com.rankkking.evolution-dashboard"; exit 1; }
+  lsof -ti tcp:$PORT -sTCP:LISTEN >/dev/null 2>&1 && { echo "port $PORT is taken (the old dashboard?). Stop it first: launchctl bootout gui/$(id -u)/com.rankkking.evolution-dashboard"; exit 1; }
   [[ -d "$REPO/desk/node_modules" ]] || (cd "$REPO/desk" && PATH="$NODE_BIN:$PATH" npm ci --omit=dev --no-audit --no-fund)
-  cd "$REPO/desk"
-  PORT=$PORT PATH="$NODE_BIN:$PATH" nohup node src/server.mjs >>"$LOG" 2>&1 &
+  nohup "$SELF" _supervise >>"$LOG" 2>&1 &
   echo $! > "$PIDFILE"
   for i in {1..20}; do curl -s -o /dev/null "http://127.0.0.1:$PORT/healthz" && { echo "desk: running at http://localhost:$PORT"; return; }; sleep 1; done
   echo "desk: did not start, see $LOG"; tail -20 "$LOG"
 }
-stop() { if p=$(pid); then kill "$p"; rm -f "$PIDFILE"; echo "desk: stopped"; else echo "desk: not running"; fi; }
+stop() {
+  if p=$(pid); then
+    kill "$p"
+    for i in {1..10}; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+    rm -f "$PIDFILE"; echo "desk: stopped"
+  else echo "desk: not running"; fi
+}
+# Runs in the background: the desk, and again after a crash (waiting 5 s, then up to 60 s).
+supervise() {
+  cd "$REPO/desk"
+  local child=0 wait_s=5
+  trap 'kill -TERM $child 2>/dev/null; wait $child 2>/dev/null; exit 0' TERM INT
+  while true; do
+    local started=$SECONDS
+    PORT=$PORT PATH="$NODE_BIN:$PATH" GIT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown) node src/server.mjs &
+    child=$!
+    wait $child; code=$?
+    [[ $code -eq 0 ]] && exit 0
+    (( SECONDS - started > 300 )) && wait_s=5
+    echo "[runner] $(date '+%F %T') the desk exited with code $code; starting it again in ${wait_s}s"
+    sleep $wait_s
+    (( wait_s = wait_s * 2 > 60 ? 60 : wait_s * 2 ))
+  done
+}
 case "${1:-status}" in
   start) start ;;
   stop) stop ;;
@@ -31,5 +55,6 @@ case "${1:-status}" in
   status) if p=$(pid); then echo "desk: running (pid $p) at http://localhost:$PORT"; else echo "desk: stopped"; fi ;;
   logs) tail -n 80 -f "$LOG" ;;
   test) cd "$REPO/desk" && PATH="$NODE_BIN:$PATH" npm test ;;
+  _supervise) supervise ;;
   *) echo "usage: $0 start|stop|restart|status|logs|test"; exit 1 ;;
 esac

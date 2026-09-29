@@ -3,10 +3,19 @@
 #
 #   cp .env.example .env   # fill it in (or run ./scripts/setup.sh, which does it for you)
 #   docker compose up -d --build
+#
+# Logs are capped (5 files of 10 MB per service), so they never fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *logging
     environment:
       POSTGRES_DB: evolution
       POSTGRES_USER: evolution
@@ -23,6 +32,7 @@ services:
   evolution:
     build: ./evolution
     restart: unless-stopped
+    logging: *logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,8 +69,12 @@ services:
       - evolution_instances:/evolution/instances
 
   desk:
-    build: ./desk
+    build:
+      context: ./desk
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     restart: unless-stopped
+    logging: *logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,11 +90,16 @@ services:
       DESK_USER: ${DESK_USER:-admin}
       DESK_PASSWORD: ${DESK_PASSWORD:?Set DESK_PASSWORD in .env}
       COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      # Evolution's session folder, read-only: the LID-to-phone files for the ad-leads list.
+      EVOLUTION_INSTANCES_DIR: /evolution-instances
       TZ: Asia/Kolkata
+    volumes:
+      - evolution_instances:/evolution-instances:ro
 
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *logging
     depends_on:
       - desk
     ports:

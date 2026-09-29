@@ -11,11 +11,14 @@ One dashboard for several WhatsApp numbers on one Evolution API server, with the
 - **Needs a person.** Groups the desk could not bind, rows without a status, unreadable groups, and rejected leads.
 - **Messages & rate card.** The two message ladders, the rate card they are built from, and the five heading styles, each with a live preview.
 - **Reports.** The team summary and each owner's brief after every run, plus every run's sends and skips. **Settings** holds every rule, owners, the team numbers and the chat spaces.
+- **Health.** Every error the code hits, grouped with its file and line and stack trace. Each number's last disconnect reason, the background jobs, disk, memory and the last backup. Problems also go to Google Chat.
+- **Claude access (MCP).** Claude Code or Claude Desktop can read the desk, and with a write token do what a person approved. See [docs/MCP.md](docs/MCP.md).
 
 The desk never answers anyone by itself.
 
 - How every step of the flow document is implemented: [docs/RULES.md](docs/RULES.md)
-- Putting it on a server: [docs/DEPLOY.md](docs/DEPLOY.md)
+- Putting it on a server, monitoring and backups: [docs/DEPLOY.md](docs/DEPLOY.md)
+- Connecting Claude: [docs/MCP.md](docs/MCP.md)
 - Adding features: [docs/EXTENDING.md](docs/EXTENDING.md)
 
 ## On a server (recommended)
@@ -47,8 +50,8 @@ desk/        the dashboard (Node 22 + Postgres, no framework, no build step)
   public/    the web app
   test/      end-to-end test, mock Evolution API, demo
 evolution/   Dockerfile for Evolution API 2.3.7 plus the three patches the desk relies on
-scripts/     setup.sh (server), backup.sh, mac/desk (local runner)
-docs/        RULES, DEPLOY, EXTENDING
+scripts/     setup.sh and update.sh (server), backup.sh, mac/desk (local runner)
+docs/        RULES, DEPLOY, EXTENDING, MCP
 ```
 
 ## Security
@@ -57,3 +60,4 @@ docs/        RULES, DEPLOY, EXTENDING
 - Only the configured host names are answered, which guards against DNS rebinding. Every change must come from the page itself: same origin and a custom header.
 - Evolution API and Postgres are never exposed to the internet. Caddy serves HTTPS with an automatic certificate.
 - Media from WhatsApp is served with `nosniff` and a sandbox policy, and unsafe types are always downloaded rather than shown.
+- Claude access needs its own token, stored only as a SHA-256 and revocable at once. A read-only token cannot change anything.

@@ -26,7 +26,7 @@ if [ ! -f .env ]; then
   echo ".env written."
 fi
 
-docker compose up -d --build
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) docker compose up -d --build
 echo
 echo "Starting. In a minute open: https://$(grep '^DESK_DOMAIN=' .env | cut -d= -f2)"
 echo "Then: Numbers -> Add WhatsApp, and scan the QR with each phone."

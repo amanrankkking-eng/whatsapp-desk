@@ -32,6 +32,7 @@ export const DEFAULTS = {
   exclude_name_words: ['01wire'],   // a name containing one of these is never in the pool
   // outputs
   team_chat_webhook: '',       // Stage 9: Google Chat space for the team summary
+  ops_chat_webhook: '',        // system alerts (errors, disconnects); empty = the team space
   intro_template: 'Hi, this is {sender_name} from Rankkking. I will be writing to you from this number from now on.',
   greeting_template: 'Hi @{tag}',
   business_name: 'Rankkking',
@@ -84,7 +85,7 @@ export async function saveSettings(input) {
   const list = v => v.map(x => String(x).trim()).filter(Boolean).slice(0, 200);
   if (Array.isArray(input.never_send_names)) out.never_send_names = list(input.never_send_names).map(x => x.toLowerCase());
   if (Array.isArray(input.exclude_name_words)) out.exclude_name_words = list(input.exclude_name_words).map(x => x.toLowerCase());
-  for (const k of ['team_chat_webhook']) {
+  for (const k of ['team_chat_webhook', 'ops_chat_webhook']) {
     if (input[k] === undefined) continue;
     const v = String(input[k]).trim();
     if (v && !/^https:\/\/chat\.googleapis\.com\/v1\/spaces\/[^\s]+$/.test(v)) throw httpError(400, 'The chat webhook must be a Google Chat webhook URL (https://chat.googleapis.com/v1/spaces/...)');

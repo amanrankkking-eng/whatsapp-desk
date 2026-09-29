@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cfg } from './config.mjs';
 import { q, one, migrate, logEvent, pool } from './db.mjs';
 import { getSettings, saveSettings } from './settings.mjs';
-import { connectionState } from './evo.mjs';
+import { connectionState, evo } from './evo.mjs';
 import * as numbers from './numbers.mjs';
 import * as chats from './chats.mjs';
 import * as ladder from './ladder.mjs';
@@ -18,11 +18,12 @@ import { planDay, approveDay, todaysBatches, nextTurn, CHECK_NAMES } from './pla
 import { workerTick, stopRun, closeRestDay } from './runner.mjs';
 import { notifyAlerts, ackAlert, buildReports, postChat } from './reports.mjs';
 import { authRequired, login, logout, cookieFor, sessionUser } from './auth.mjs';
-import { istDate, istToUtc, addIstDays, now, setClock, advanceClock, httpError, clampInt, TEXT_SQL, typeLabel } from './util.mjs';
+import { istDate, istToUtc, now, setClock, advanceClock, httpError, clampInt } from './util.mjs';
+import { VERSION, recordError, opsAlert, monitorTick, healthReport, listErrors, errorDetail, resolveErrors, noteStart, noteCleanStop } from './monitor.mjs';
+import * as mcp from './mcp.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, '..', 'public');
-const VERSION = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8')).version;
 
 // ---------------------------------------------------------------- routing
 const routes = [];
@@ -38,16 +39,34 @@ const workerState = {};
 function every(ms, name, fn, { firstAfter = 3000 } = {}) {
   workers.push({ ms, name, fn, firstAfter });
 }
+// Every failure is recorded on the Health page. A job that fails three times in a row is
+// reported to the chat space, and so is its recovery.
 async function runWorker(name, fn) {
-  const st = (workerState[name] ||= { running: false, lastOk: null, lastError: null, runs: 0 });
+  const st = (workerState[name] ||= { running: false, lastOk: null, lastError: null, runs: 0, fails: 0 });
   if (st.running) return;
   st.running = true;
-  try { st.lastResult = await fn(); st.lastOk = now().toISOString(); st.lastError = null; }
-  catch (e) { st.lastError = String(e.message || e).slice(0, 300); console.error(`[worker ${name}]`, e.message); }
-  finally { st.running = false; st.runs++; }
+  try {
+    st.lastResult = await fn(); st.lastOk = now().toISOString(); st.lastError = null;
+    if (st.fails >= 3) await opsAlert(`job-ok:${name}:${st.failingSince}`, `✅ The ${name} job works again.`, 0);
+    st.fails = 0;
+  } catch (e) {
+    st.lastError = String(e.message || e).slice(0, 300);
+    if (!st.fails) st.failingSince = Date.now();
+    st.fails++;
+    console.error(`[worker ${name}]`, e.message);
+    await recordError(`job:${name}`, e);
+    if (st.fails === 3) {
+      const dbDown = /ECONNREFUSED|Connection terminated|terminating connection|the database system is/i.test(st.lastError);
+      await opsAlert(`job-failing:${name}:${st.failingSince}`, dbDown
+        ? `🔴 The database is not answering (the ${name} job failed 3 times in a row: ${st.lastError}).`
+        : `🔴 The ${name} job failed 3 times in a row. Last error: ${st.lastError}`, 0);
+    }
+  } finally { st.running = false; st.runs++; }
 }
+const workerList = () => workers.map(w => ({ name: w.name, everyMs: w.ms, ...workerState[w.name] }));
 
 // Stage 2, 3, 4 and 11 every few minutes: new groups, binding, the read, statuses and replies.
+let lastLidFileRead = 0;
 async function readCycle() {
   await numbers.syncNumbers();
   const open = [];
@@ -64,6 +83,7 @@ async function readCycle() {
     else for (const jid of (await numbers.newGroupJids(inst)).slice(0, 20)) await numbers.refreshOneGroup(inst, jid).catch(() => {});
   }
   await numbers.learnLidsFromMessages();
+  if (Date.now() - lastLidFileRead > 10 * 60000) { lastLidFileRead = Date.now(); await numbers.learnLidsFromFiles().catch(e => console.error('[lids]', e.message)); }
   await numbers.rebuildPeople();
   const b = await bindGroups();
   const r = await readGroups();
@@ -106,7 +126,7 @@ route('POST', '/api/logout', async ({ req, res }) => {
 route('GET', '/api/me', async ({ user }) => ({ user, authRequired: authRequired(), test: cfg.test, version: VERSION }), { public: true });
 
 // ---------------------------------------------------------------- API: overview
-route('GET', '/api/overview', async () => {
+async function overviewData() {
   const today = istDate();
   const since = istToUtc(today, '00:00');
   const [stages] = [await q(`select stage, count(*)::int n from desk.resellers group by stage`)];
@@ -121,9 +141,11 @@ route('GET', '/api/overview', async () => {
     from desk.runs r order by id desc limit 1`);
   const states = await liveStates();
   const nums = (await numbers.listNumbers()).map(n => ({ ...n, state: states[n.instance] || n.state }));
+  const openErrors = await one(`select count(*)::int n from desk.errors where resolved_at is null`);
   return { today, stages, sentToday: sentToday.n, repliesToday, openAlerts: openAlerts.n, bindIssues: issues.n, needsStatus: needs.n,
-    lastRun: run, numbers: nums, batches: await todaysBatches(), workers: workerState };
-});
+    openErrors: openErrors.n, lastRun: run, numbers: nums, batches: await todaysBatches(), workers: workerState };
+}
+route('GET', '/api/overview', overviewData);
 
 // ---------------------------------------------------------------- API: numbers
 route('GET', '/api/numbers', async () => {
@@ -239,28 +261,10 @@ route('GET', '/api/runs/:id', async ({ params }) => {
 route('POST', '/api/runs/:id/stop', async ({ params, user }) => stopRun(intOf(params.id), `stopped by ${user || 'a person'}`, user));
 
 // ---------------------------------------------------------------- API: replies and alerts
-route('GET', '/api/alerts', async ({ query }) => q(`select a.*, r.code, r.name, o.name owner_name,
-    (select subject from desk.groups g where g.jid = a.jid and subject is not null limit 1) group_name
-  from desk.alerts a join desk.resellers r on r.id = a.reseller_id left join desk.owners o on o.id = a.owner_id
-  where ($1 = 'all' or a.acked_at is null) order by a.acked_at nulls first, a.last_at desc limit 300`, [query.get('show') === 'all' ? 'all' : 'open']));
+route('GET', '/api/alerts', async ({ query }) => chats.listAlerts(query.get('show')));
 route('POST', '/api/alerts/:id/ack', async ({ params, user }) => ackAlert(intOf(params.id), user));
 // Replies on a day, for every group of every number (not only reseller groups).
-route('GET', '/api/replies', async ({ query }) => {
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(query.get('day') || '') ? query.get('day') : istDate();
-  const from = istToUtc(day, '00:00').getTime() / 1000, to = istToUtc(addIstDays(day, 1), '00:00').getTime() / 1000;
-  // Several of our numbers can sit in one group and each stores the same message: count ids once.
-  const rows = await q(`select m.jid, count(distinct m.id) filter (where not m.ours)::int replies, count(distinct m.id) filter (where m.ours)::int ours,
-      max(m.ts) filter (where not m.ours) last_ts, array_agg(distinct m.instance) instances
-    from desk.msgx m where m.ts >= $1 and m.ts < $2 and m.jid like '%@g.us' group by m.jid order by replies desc`, [from, to]);
-  const jids = rows.map(r => r.jid);
-  const names = await q(`select distinct on (jid) jid, subject from desk.groups where jid = any($1) and subject is not null`, [jids]);
-  const rs = await q(`select id, code, name, group_jid from desk.resellers where group_jid = any($1)`, [jids]);
-  const last = await q(`select distinct on (jid) jid, ${TEXT_SQL} txt, type, sender_name from desk.msgx
-    where jid = any($1) and not ours and ts >= $2 and ts < $3 order by jid, ts desc`, [jids, from, to]);
-  return { day, groups: rows.map(r => ({ ...r, last_ts: Number(r.last_ts) || null, name: names.find(n => n.jid === r.jid)?.subject || r.jid,
-    reseller: rs.find(x => x.group_jid === r.jid) || null,
-    lastText: (x => x ? `${x.sender_name ? `${x.sender_name}: ` : ''}${typeLabel(x.type, x.txt)}`.slice(0, 200) : '')(last.find(l => l.jid === r.jid)) })) };
-});
+route('GET', '/api/replies', async ({ query }) => chats.repliesByDay(query.get('day')));
 
 // ---------------------------------------------------------------- API: messages and rate card
 route('GET', '/api/ladder', async () => ladder.ladderState());
@@ -322,9 +326,34 @@ route('POST', '/api/run-worker/:name', async ({ params }) => {
   return workerState[w.name];
 });
 
+// ---------------------------------------------------------------- API: health, errors, Claude access
+route('GET', '/api/health', async () => healthReport(workerList()));
+route('GET', '/api/errors', async ({ query }) => listErrors({ show: query.get('show'), limit: query.get('limit') }));
+route('GET', '/api/errors/:id', async ({ params }) => {
+  const e = await errorDetail(intOf(params.id));
+  if (!e) throw httpError(404, 'Unknown error');
+  return e;
+});
+route('POST', '/api/errors/:id/resolve', async ({ params, user }) => resolveErrors([intOf(params.id)], user));
+route('POST', '/api/errors/resolve-all', async ({ user }) => resolveErrors('all', user));
+// Errors in the browser (a page that breaks) are recorded like server errors.
+let clientErrors = { minute: 0, n: 0 };
+route('POST', '/api/client-error', async ({ body }) => {
+  const m = Math.floor(Date.now() / 60000);
+  if (clientErrors.minute !== m) clientErrors = { minute: m, n: 0 };
+  if (++clientErrors.n > 20) return { ok: false };
+  const err = { message: String(body.message || 'unknown').slice(0, 500), stack: String(body.stack || '').slice(0, 3000) };
+  await recordError('browser', err, { page: String(body.page || '').slice(0, 200), where: String(body.where || '').slice(0, 200), agent: String(body.agent || '').slice(0, 200) });
+  return { ok: true };
+}, { limit: 32 << 10 });
+route('GET', '/api/tokens', async () => mcp.listTokens());
+route('POST', '/api/tokens', async ({ body, user }) => mcp.createToken(body.name, body.scope, user));
+route('DELETE', '/api/tokens/:id', async ({ params, user }) => mcp.revokeToken(intOf(params.id), user));
+
 // ---------------------------------------------------------------- test-only routes (DESK_TEST=1)
 if (cfg.test) {
   route('GET', '/api/test/clock', async () => ({ now: now().toISOString(), ist: istDate() }));
+  route('POST', '/api/test/boom', async ({ body }) => { throw new Error(String(body.message || 'test failure')); });
   route('POST', '/api/test/clock', async ({ body }) => {
     if (body.iso) setClock(body.iso);
     if (body.advanceMs) advanceClock(Number(body.advanceMs));
@@ -379,16 +408,66 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+// ---------------------------------------------------------------- Claude access (MCP, Streamable HTTP)
+// POST /mcp with a JSON-RPC message and "Authorization: Bearer <token>". No sessions and no
+// server-to-client stream: every request stands alone, so a restart never breaks a client.
+const mcpCtx = { overview: overviewData, workerList, liveStates };
+async function mcpEndpoint(req, res) {
+  const json = (status, data, extra = {}) => {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...extra });
+    res.end(data === undefined ? '' : JSON.stringify(data));
+  };
+  // A web page on another site must never reach the desk through a browser (DNS rebinding).
+  const origin = req.headers.origin;
+  if (origin) {
+    let host = ''; try { host = new URL(origin).host.toLowerCase(); } catch {}
+    if (!cfg.allowedHosts.has(host)) return json(403, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Cross-site request refused' } });
+  }
+  if (req.method !== 'POST') return json(405, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Use POST' } }, { allow: 'POST' });
+  const tok = await mcp.tokenUser(req);
+  if (!tok) {
+    return json(401, { jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Missing or unknown token. Make one in the dashboard: Settings → Claude access.' } },
+      { 'www-authenticate': 'Bearer realm="whatsapp-desk"' });
+  }
+  const pv = req.headers['mcp-protocol-version'];
+  if (pv && !mcp.PROTOCOL_VERSIONS.includes(pv)) {
+    return json(400, { jsonrpc: '2.0', id: null, error: { code: -32000, message: `Unsupported MCP protocol version ${pv}. Supported: ${mcp.PROTOCOL_VERSIONS.join(', ')}` } });
+  }
+  let msg;
+  try { msg = await readBody(req, 6 << 20); } catch (e) {
+    return json(e.status === 413 ? 413 : 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: e.message } });
+  }
+  const out = await mcp.handleRpc(msg, tok, mcpCtx);
+  if (out == null) return json(202);
+  return json(200, out);
+}
+
+// Public, for an uptime monitor: 503 when the database or Evolution API is not answering.
+let healthzCache = { at: 0, status: 0, body: null };
+async function healthz(url) {
+  if (url.searchParams.has('self')) {
+    const db = await one('select 1 ok').then(() => true).catch(() => false);
+    return { status: db ? 200 : 503, body: { ok: db, db, version: VERSION } };
+  }
+  if (Date.now() - healthzCache.at < 10000) return healthzCache;
+  const db = await one('select 1 ok').then(() => true).catch(() => false);
+  const evolution = await evo('GET', '/instance/fetchInstances', null, 5000).then(() => true).catch(() => false);
+  const nums = db ? await q(`select count(*)::int total, count(*) filter (where state = 'open')::int open from desk.numbers where active`).then(r => r[0]).catch(() => null) : null;
+  const ok = db && evolution;
+  healthzCache = { at: Date.now(), status: ok ? 200 : 503, body: { ok, db, evolution, numbers: nums, version: VERSION } };
+  return healthzCache;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const pathname = url.pathname;
   try {
     // DNS-rebinding guard: only answer to the host names this desk is served on.
     if (!cfg.allowedHosts.has(String(req.headers.host || '').toLowerCase())) return send(res, 421, { error: 'Unknown host' });
-    if (pathname === '/healthz') {
-      const db = await one('select 1 ok').then(() => true).catch(() => false);
-      return send(res, db ? 200 : 503, { ok: db, version: VERSION });
-    }
+    if (pathname === '/healthz') { const h = await healthz(url); return send(res, h.status, h.body); }
+    if (pathname === '/mcp') return await mcpEndpoint(req, res);
+    // No OAuth here: a client that looks for it gets a plain 404, not the app page.
+    if (pathname.startsWith('/.well-known/')) return send(res, 404, { error: 'not found' });
     if (!pathname.startsWith('/api/')) {
       if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'method not allowed' });
       return serveStatic(req, res, pathname);
@@ -414,6 +493,7 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     const status = e.status || (e.evoStatus ? 502 : 500);
     if (status >= 500) console.error('[api]', req.method, pathname, e.stack || e.message);
+    if (status >= 500 && !e.evoStatus) await recordError('api', e, { method: req.method, path: pathname });
     send(res, status, { error: e.message || 'Something went wrong' });
   }
 });
@@ -442,7 +522,13 @@ every(5000, 'sender', workerTick, { firstAfter: 8000 });
 every(3 * 60000, 'read', readCycle, { firstAfter: 4000 });
 every(60000, 'alerts', notifyAlerts, { firstAfter: 20000 });
 every(5 * 60000, 'day-close', closeRestDay, { firstAfter: 60000 });
-every(6 * 3600000, 'cleanup', async () => { await q(`delete from desk.sessions where expires_at < now()`); return { ok: true }; });
+every(30000, 'monitor', monitorTick, { firstAfter: 15000 });
+every(6 * 3600000, 'cleanup', async () => {
+  await q(`delete from desk.sessions where expires_at < now()`);
+  await q(`delete from desk.errors where resolved_at < now() - interval '90 days'`);
+  await q(`delete from desk.ops_alerts where last_sent_at < now() - interval '30 days'`);
+  return { ok: true };
+});
 
 // On a fresh server the desk can start before Evolution has created its tables.
 async function waitForEvolutionTables() {
@@ -457,10 +543,11 @@ async function waitForEvolutionTables() {
 async function main() {
   await waitForEvolutionTables();
   await migrate();
+  await noteStart();
   await ladder.seedLadder();
   const plugins = await loadPlugins();
   if (plugins.length) console.log('[desk] plugins:', plugins.join(', '));
-  route('GET', '/api/workers', async () => ({ workers: workers.map(w => ({ name: w.name, everyMs: w.ms, ...workerState[w.name] })), plugins }));
+  route('GET', '/api/workers', async () => ({ workers: workerList(), plugins }));
   // A send that was in flight when the desk stopped may or may not have reached WhatsApp.
   // It is never retried blindly: it is marked failed and its run stops (85).
   const stuck = await q(`update desk.sends set status = 'failed', error = 'the desk restarted while this message was being sent - check the group before sending it again'
@@ -474,7 +561,23 @@ async function main() {
   }
 }
 
-const shutdown = () => { server.close(); pool.end().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); };
+const shutdown = async () => {
+  setTimeout(() => process.exit(0), 3000).unref();
+  server.close();
+  await noteCleanStop();
+  pool.end().finally(() => process.exit(0));
+};
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+// A promise nobody handled is a bug: record it and keep running.
+process.on('unhandledRejection', e => {
+  console.error('[desk] unhandled rejection:', e);
+  recordError('process', e instanceof Error ? e : new Error(String(e)));
+});
+// An exception nobody caught leaves the process in an unknown state: record it, then exit so
+// the supervisor (Docker, or scripts/mac/desk) starts a clean one. The next start reports it.
+process.on('uncaughtException', e => {
+  console.error('[desk] crashed:', e);
+  Promise.race([recordError('process', e, { fatal: true }), new Promise(r => setTimeout(r, 2000))]).finally(() => process.exit(1));
+});
 main().catch(e => { console.error('[desk] failed to start:', e); process.exit(1); });

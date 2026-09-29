@@ -221,6 +221,18 @@ export async function newGroupJids(instance) {
       and not exists (select 1 from desk.groups g where g.instance = $1 and g.jid = c."remoteJid")`, [instance])).map(r => r.jid);
 }
 
+// Learn lid -> phone from the mapping files Evolution keeps for every number. WhatsApp hands
+// these over when a number links, so ad leads and new chats show a real phone number.
+export async function learnLidsFromFiles() {
+  const { lidPhoneMap } = await import('./adleads.mjs');
+  const map = lidPhoneMap();
+  if (!map.size) return { learned: 0 };
+  const lids = [...map.keys()].map(l => `${l}@lid`), phones = [...map.values()];
+  const r = await q(`insert into desk.lid_map (lid, phone) select * from unnest($1::text[], $2::text[])
+    on conflict (lid) do update set phone = excluded.phone where desk.lid_map.phone is distinct from excluded.phone returning lid`, [lids, phones]);
+  return { learned: r.length, known: map.size };
+}
+
 // Learn lid -> phone from messages (live messages carry both ids since Baileys 7).
 export async function learnLidsFromMessages() {
   await q(`insert into desk.lid_map (lid, phone)

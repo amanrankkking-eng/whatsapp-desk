@@ -1,12 +1,12 @@
 // Every rule the flow runs on, editable in one place, plus owners and the chat space.
-import { get, post, api, esc, icon, toast, fail, modal, confirmBox } from '../core.js';
+import { get, post, api, esc, icon, toast, fail, modal, confirmBox, dateTime, ago } from '../core.js';
 
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export default {
   id: 'settings', title: 'Settings', icon: 'settings',
   create({ view }) {
-    let s = null, owners = [];
+    let s = null, owners = [], tokens = [];
     const num = (k, label, help, min, max) => `<label class="f"><span>${label}</span><input class="in" type="number" data-n="${k}" value="${esc(s[k])}" min="${min}" max="${max}">${help ? `<span class="help">${help}</span>` : ''}</label>`;
     const phoneRows = (key, map) => `<div class="stack" data-map="${key}">${Object.entries(map || {}).map(([p, n]) => phoneRow(p, n)).join('')}</div>
       <button class="btn sm" data-addrow="${key}" type="button" style="margin-top:8px">${icon('plus', 'sm')} Add</button>`;
@@ -18,7 +18,21 @@ export default {
         <div class="card"><div class="hd"><h3>Google Chat</h3></div><div class="bd stack">
           <label class="f"><span>Team chat space webhook</span><input class="in" data-t="team_chat_webhook" value="${esc(s.team_chat_webhook)}" placeholder="https://chat.googleapis.com/v1/spaces/…/messages?key=…&token=…">
             <span class="help">After every run the day's summary goes here: what went, what was skipped and why, who waits, who needs a status, who is due tomorrow, unanswered replies. In Google Chat: space → Apps &amp; integrations → Webhooks → Add.</span></label>
-          <div><button class="btn sm" data-test="team_chat_webhook" type="button">Send a test message</button></div></div></div>
+          <div><button class="btn sm" data-test="team_chat_webhook" type="button">Send a test message</button></div>
+          <label class="f"><span>System alerts webhook (optional)</span><input class="in" data-t="ops_chat_webhook" value="${esc(s.ops_chat_webhook)}" placeholder="https://chat.googleapis.com/v1/spaces/…/messages?key=…&token=…">
+            <span class="help">Where the desk reports its own problems: a number that disconnects (with the reason), a job that keeps failing, a new error in the code, a crash and restart, a full disk, a missed backup. Empty = the team space above.</span></label>
+          <div><button class="btn sm" data-test="ops_chat_webhook" type="button">Send a test message</button></div></div></div>
+
+        <div class="card"><div class="hd"><h3>Claude access (MCP)</h3><span class="spacer"></span><button class="btn sm primary" data-newtoken type="button">${icon('plus', 'sm')} Make a token</button></div>
+          <div class="bd stack">
+            <div class="help">Lets Claude (Claude Code, or Claude Desktop) read this desk and, with a write token, log calls, approve the day you approved, or send one message you approved. Every call Claude makes is in the Activity log under "mcp.".</div>
+            ${tokens.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Access</th><th>Made</th><th>Last used</th><th></th></tr></thead><tbody>
+              ${tokens.map(t => `<tr${t.revoked_at ? ' style="opacity:.5"' : ''}><td><b>${esc(t.name)}</b></td>
+                <td>${t.scope === 'write' ? '<span class="pill warn">read + change</span>' : '<span class="pill">read only</span>'}</td>
+                <td class="small">${esc(dateTime(t.created_at))}</td><td class="small">${t.revoked_at ? `revoked ${esc(ago(t.revoked_at))}` : esc(ago(t.last_used_at))}</td>
+                <td class="nowrap">${t.revoked_at ? '' : `<button class="btn sm danger" data-revoke="${t.id}" type="button">Revoke</button>`}</td></tr>`).join('')}
+            </tbody></table></div>` : '<div class="muted small">No token yet.</div>'}
+          </div></div>
 
         <div class="card"><div class="hd"><h3>Owners</h3><span class="spacer"></span><button class="btn sm primary" data-newowner type="button">${icon('plus', 'sm')} Add owner</button></div>
           <div class="bd">${owners.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Phone</th><th>Alerts go to</th><th class="num">Resellers</th><th></th></tr></thead><tbody>
@@ -92,9 +106,15 @@ export default {
     function bind() {
       view.addEventListener('click', e => { if (e.target.closest('[data-rm]')) e.target.closest('[data-pr]').remove(); });
       view.querySelectorAll('[data-addrow]').forEach(b => b.onclick = () => view.querySelector(`[data-map="${b.dataset.addrow}"]`).insertAdjacentHTML('beforeend', phoneRow()));
-      view.querySelector('[data-test]').onclick = async () => {
-        try { await post('/api/settings/test-chat', { webhook: view.querySelector('[data-t="team_chat_webhook"]').value }); toast('Test message sent', 'ok'); } catch (e) { fail(e); }
-      };
+      view.querySelectorAll('[data-test]').forEach(b => b.onclick = async () => {
+        try { await post('/api/settings/test-chat', { webhook: view.querySelector(`[data-t="${b.dataset.test}"]`).value }); toast('Test message sent', 'ok'); } catch (e) { fail(e); }
+      });
+      view.querySelector('[data-newtoken]').onclick = () => newToken();
+      view.querySelectorAll('[data-revoke]').forEach(b => b.onclick = async () => {
+        const t = tokens.find(x => x.id === Number(b.dataset.revoke));
+        if (!await confirmBox('Revoke token', `Revoke "${t.name}"? Claude stops reaching the desk with it at once.`, { ok: 'Revoke', danger: true })) return;
+        try { await api('DELETE', `/api/tokens/${t.id}`); toast('Revoked', 'ok'); await load(); } catch (e) { fail(e); }
+      });
       view.querySelector('[data-newowner]').onclick = () => editOwner({});
       view.querySelectorAll('[data-editowner]').forEach(b => b.onclick = () => editOwner(owners.find(o => o.id === Number(b.dataset.editowner))));
       view.querySelector('[data-save]').onclick = async () => {
@@ -132,8 +152,37 @@ export default {
         ],
       });
     }
+    function newToken() {
+      modal({
+        title: 'Make a token for Claude',
+        body: `<div class="stack"><label class="f"><span>Name</span><input class="in" data-f="name" placeholder="Claude Code on Aman's Mac"></label>
+          <label class="f"><span>Access</span><select class="in" data-f="scope">
+            <option value="read">Read only: status, chats, resellers, today's preview, health, errors</option>
+            <option value="write">Read + change: also log calls, set statuses, approve the day, send one approved message</option></select>
+            <span class="help">Even with change access, Claude has to pass confirm=true, which it is told to do only after you say yes. The reader number, never-send groups and do-not-contact rows stay refused.</span></label></div>`,
+        actions: [{ label: 'Cancel' }, { label: 'Make token', kind: 'primary', onClick: async ctl => {
+          const v = k => ctl.body.querySelector(`[data-f="${k}"]`).value;
+          const t = await post('/api/tokens', { name: v('name'), scope: v('scope') });
+          await load();
+          showToken(t);
+        } }],
+      });
+    }
+    function showToken(t) {
+      const url = `${location.origin}/mcp`;
+      const cmd = `claude mcp add --transport http --scope user whatsapp-desk ${url} --header "Authorization: Bearer ${t.token}"`;
+      const desktop = JSON.stringify({ mcpServers: { 'whatsapp-desk': { command: 'npx', args: ['-y', 'mcp-remote', url, '--header', 'Authorization:${AUTH}'], env: { AUTH: `Bearer ${t.token}` } } } }, null, 2);
+      modal({
+        title: `Token "${t.name}"`, wide: true,
+        body: `<div class="stack"><div class="note warn">Copy it now. The desk keeps only a fingerprint of it, so it is never shown again. Anyone with it can ${t.scope === 'write' ? 'read and change' : 'read'} this desk: keep it out of chats and screenshots.</div>
+          <label class="f"><span>Token</span><input class="in mono" readonly value="${esc(t.token)}" data-copy></label>
+          <label class="f"><span>Claude Code: run this once in a terminal</span><textarea class="in mono small" rows="3" readonly data-copy>${esc(cmd)}</textarea></label>
+          <label class="f"><span>Claude Desktop: add to claude_desktop_config.json (needs Node.js)</span><textarea class="in mono small" rows="9" readonly data-copy>${esc(desktop)}</textarea></label></div>`,
+        actions: [{ label: 'Copy the Claude Code command', onClick: async () => { await navigator.clipboard.writeText(cmd); toast('Copied', 'ok'); return false; } }, { label: 'Done', kind: 'primary' }],
+      }).body.querySelectorAll('[data-copy]').forEach(x => x.onclick = () => x.select());
+    }
     async function load() {
-      [s, owners] = await Promise.all([get('/api/settings'), get('/api/owners')]);
+      [s, owners, tokens] = await Promise.all([get('/api/settings'), get('/api/owners'), get('/api/tokens')]);
       render();
     }
     return { load };
